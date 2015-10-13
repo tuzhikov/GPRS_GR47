@@ -1,0 +1,2635 @@
+/*
+_______________________________________________________________________________
+This program is being written by SKB
+
+Copyright (C) Navigator-Technology. Orel, Russia
+_______________________________________________________________________________
+*/
+
+#include <c8051f120.h>
+#include <math.h>
+#include <intrins.h>
+#include "MAIN.h"
+#include "config.h"
+#include "ADC.h"
+#include "SENSOR.h"
+#include "uart.h"
+#include "io.h"
+#include "io_sms.h"
+#include "ds18b20.h"
+#include "rele.h"
+#include "atflash.h"
+#include "rmodem.h"
+#include "gprs\gprs.h"
+#include "kod8.h"
+
+
+
+#pragma FF (0)
+
+
+
+bit FlagTX1 = 0;
+bit FlagTX0 = 0;
+
+#define m_SIZE 8 //длина (байт) масок mLogger, mAuto, mAlarm, записанных в flash-памяти
+unsigned char xdata FlashDump[1024]; //1024 байт требуется для записи 1 страницы flash uC
+
+unsigned char xdata time_wait;
+unsigned char xdata time_wait_lan = 0;
+
+unsigned char xdata port_ADC_latch = 0;
+
+
+unsigned int xdata Beacon_timer = 0; //счетчик (в мин) времени оповещения маяка
+unsigned int xdata Day_timer = 0; //счетчик суточного времени в минутах
+
+unsigned char xdata time_wait_io;
+unsigned char xdata time_wait_io2;
+unsigned char xdata time_wait_io3;
+unsigned char xdata time_wait_SMSPhone;
+unsigned  int xdata time_wait_SMSPhone1;
+unsigned char xdata time_wait_phone_receive;
+unsigned char xdata time_wait_SMSPhone2;
+unsigned char xdata time_wait_test;
+unsigned char xdata time_wait_txtsms;
+unsigned char xdata time_nogprs = 0;
+
+
+unsigned char xdata count_restart_cpu;
+unsigned char xdata count_restart_gsm;
+
+
+
+unsigned char xdata DataLogger[128] = {0x0};
+
+unsigned char xdata cnt; //Counter общего назначения
+
+unsigned char xdata Char; //общего назначения
+unsigned char xdata * pChar; //общего назначения
+unsigned int xdata Int; //общего назначения
+unsigned int xdata * pInt; //общего назначения
+float xdata Float; //общего назначения
+float xdata Float1; //общего назначения
+//float xdata * pFloat; //общего назначения
+
+
+//поиск записей в журнале по битовой маске________________________________________
+
+unsigned char xdata StateSearch = 0x00;
+bit SearchEnable = 0; //включает автомат поиска
+
+unsigned long xdata Search1_Time; //временной диапазон поиска - начало
+unsigned long xdata Search2_Time; //временной диапазон поиска - конец
+
+unsigned int xdata CountSearchPoints; //счетчик найденных точек по рез-там поиска
+unsigned int xdata AmountSearchPoints = 65535; //максимальное количество точек для поиска
+
+unsigned long xdata * pTimeL = FlashDump;
+
+union EVENTS xdata MaskEvents; //маска для поиска
+union EVENTS xdata * pEvents = &FlashDump[0x7B]; //ук. на текущее считанное значение
+//_________________________________________________________________________________
+
+
+unsigned long xdata Timer_inside = 0L;
+bit Timer_tick = 0; //указывает, что таймер увеличился
+
+
+//глобальные
+union EVENTS xdata CurrentEvents = {0x0}; //текущие состояния
+union EVENTS xdata PreviousEvents = {0x0}; //предыдущие состояния
+union EVENTS xdata mLogger; //from Setup
+union EVENTS xdata mResult = {0x0};  //CurrentEvents <XOR> PreviousEvents
+union EVENTS xdata mStore = {0x0};  //Временное содержимое mResult
+union LIMITS xdata LimitsData; //from Setup
+
+
+//обработка автоматического вывода данных по каналу связи
+union EVENTS xdata mAuto;   //from Setup
+union EVENTS xdata mAlarm;  //from Setup
+
+unsigned char xdata DataRAM[(AlarmPointSize+8)*AMOUNT_DATARAM_POINTS]; //буфер аварийного вывода
+unsigned int xdata DataRAMPointer = 0; //номер текущего байта
+union EVENTS xdata AddAlarmEvents = {0x0}; //текущая битовая маска тревоги
+union EVENTS xdata AlarmEvents = {0x0}; //накопительная битовая маска тревоги
+unsigned char xdata AlarmTickCounter = 0; //счетчик тактов для записи данных в буфер DataRAM
+#define NAlarmTicks 2 //интервал времени в тактах, подсчитываемый AlarmTickCounter
+unsigned char xdata AmountAlarmPoints = 0; //количество точек в буфере DataRAM[]
+
+
+unsigned char xdata NTicks; //количество тактов, задаваемое из Setup,
+                            //через которое выполняется регистрация событий
+unsigned char xdata TickCounter = 0; //счетчик тактов
+
+
+unsigned char xdata FD_Auto[64];  //from Setup - профиль формата вывода в режиме Auto
+unsigned char xdata FD_Alarm[64]; //from Setup - профиль формата вывода в режиме Alarm
+unsigned char xdata FD_Req[64];   //from Setup - профиль формата вывода в режиме Request
+
+//unsigned char xdata S_Password[12]; //from Setup2 - Password
+//unsigned char xdata S_PinCode[4];   //from Setup2 - Pin-code
+
+
+//структура формата вывода FD:
+struct { //max = 8
+    unsigned char Sta : 1; //Status
+    unsigned char DrR : 1; //Dry sensors, Relays
+    unsigned char ADC : 1; //ADC-inputs, d/dt
+    unsigned char Sys : 1; //System Parameters
+    unsigned char Bl1 : 1; //Data Block1
+    unsigned char Bl2 : 1; //Data Block2
+       } xdata FD;
+unsigned char xdata * pFD = &FD;
+unsigned char xdata * pOutBuffer = DataLogger;
+
+unsigned char xdata * pFD_Mask = FD_Alarm;
+
+
+xdata struct {
+          unsigned char In[140]; //буфер ввода по каналу связи
+          struct SMS_HDR Header;
+          unsigned char Out[SizeBufOut + AlarmPointSize+9]; //буфер вывода по каналу связи
+          unsigned char OutAuto[SizeBufOut + AlarmPointSize+9]; //--||-- для авторежима
+             } IOStreamBuf = {0x0};
+xdata struct {
+          unsigned int In; //слово состояния буфера ввода
+          unsigned int Out; //слово состояния буфера вывода
+          unsigned char ReqID; //код обрабатываемого запроса
+             } IOStreamState = {0x0000, 0x0800, 0x00}; //вывод в авторежиме
+bit OutBufChange; //определяет, изменялись ли данные в буфере вывода
+unsigned char xdata IOBufPointer = 0; //указатель на текущий записываемый байт в буфере вывода
+unsigned char xdata SMS_Tail[2] = {0x0}; //длины "хвостов" для пакетов SMS (max == AlarmPointSize)
+
+
+//AUTO режим_____________________________________________________________________________________
+unsigned int xdata CountAuto = 0; //счетчик накопленных точек по маске mAuto
+bit Auto_Enable = 1; //включен режим автоматического вывода данных
+unsigned int xdata saveIOBufPointer;
+unsigned int xdata saveSMS_Tail;
+unsigned int xdata saveIOStreamStateOut;
+unsigned long xdata saveRdHeader;
+unsigned char xdata saveStateSearch;
+unsigned long xdata saveSearch2Time;
+unsigned int xdata saveAmountSearchPoints;
+unsigned int xdata saveCountSearchPoints;
+//_______________________________________________________________________________________________
+
+
+unsigned char xdata GSM_signal;
+unsigned char xdata GSM_signal_prev = 0;
+
+
+bit ForbiddenAll = 1; //время неизвестно..
+bit GetBack_m = 0;  //восстановление битов mResult для записи в журнал
+
+bit Alarm_Enable = 0; //включение режима передачи данных по тревоге
+bit Lock_DataRAM = 0; //блокировка буфера тревоги
+
+
+//обработка запросов с ЦДП - automat_request()___________________________________________________
+unsigned char xdata StateRequest = 0x00;
+//_______________________________________________________________________________________________
+
+
+bit RestoreSearch = 0; //указывает на необходимость продолжения поиска запроса/тревоги
+
+
+//тревога - automat_alarm()______________________________________________________________________
+unsigned char xdata StateAlarm = 0x00;
+unsigned char xdata AlarmPointNum; //номер выводимой точки (начиная с последней)
+//_______________________________________________________________________________________________
+
+
+#define HystVolt  5 //гистерезис для напряжений питания
+#define HystADC   2 //гистерезис для сигналов АЦП, дифференциалов АЦП
+#define HystTherm 3 //гистерезис для температуры чипа, температуры датчика MicroLan
+
+//включается по достижении опорного времени маяка; выключается в 0:00GMT
+//если времени нет, маяк ВКЛЮЧЕН и формирует запросы пакета ONLINE
+bit Beacon_Enable = 1;
+
+
+unsigned long xdata Rele_LCount = 0;
+
+
+bit DefaultProfile = 0; //"1" - используется профиль устройства "по умолчанию" -
+                        //соотв. некорректным данным, считанным из flash ([F_ADDR_SETUP])
+unsigned char xdata reset_code; //код рестарта CPU
+
+
+//сжатие маски событий___________________________________________________________________________
+bit CMask = 0;
+unsigned char xdata CMask_cnt; //счетчик байтов сжатой маски
+unsigned char xdata CMask_buf[9];
+//_______________________________________________________________________________________________
+
+
+//восстановление из журнала не отправленных вовремя тревог_______________________________________
+bit RA_Mode = 0; //имеются неотправленные тревоги (заносится в Flash контроллера)
+
+//"Restore Alarms"' Address (EEPROM/DataFlash)
+//RAA1 - адрес (в журнале) последней возникшей (последней неотпраленной) тревоги
+unsigned int xdata RAA1;
+//RAA2 - адрес (в журнале) первой неотправленной / последней отправленной тревоги
+unsigned int xdata RAA2;
+unsigned int xdata RAA3;
+//RA_cnt - счетчик накопленных неотправленных тревог
+signed char xdata RA_cnt = 0;
+#define RA_cnt_MAX 50
+#define RA_cnt_MIN 25
+signed char xdata RA_tmp = 0;
+
+//Формат StateSendSMS
+//[ЗТАRзтаr]: З - ответ на последний запрос в стадии отправки SMS;
+//            Т - последняя тревога в стадии отправки SMS;
+//            А - последнее автосообщение в стадии отправки SMS;
+//            R - последнее сообщение RA в стадии отправки SMS;
+//            з - ответ на последний запрос отправить не удалось;
+//            т - последнюю тревогу отправить не удалось;
+//            а - последнне автосообщение отправить не удалось;
+//            r - последнее сообщение RA отправить не удалось
+unsigned char xdata StateSendSMS = 0x00;
+unsigned char xdata State__RA = 0x00; //состояние чтения точек в режиме RA
+unsigned char xdata TimeRA = 0xFE; //"0xFE" - срабатывать сразу по рестарту
+//_______________________________________________________________________________________________
+
+
+unsigned int code LED_Mode[] = {
+    ~0x0000,   //OFF
+    ~0xFFFF,   //ON
+    ~0x5555,   //NO TIME
+    ~0x7777,   //NO TIME + USB
+    ~0x0FF0,   //NORMAL
+    ~0x3FFC,   //NORMAL + USB
+    ~0x0001,   //SEND SMS
+    ~0x0005    //SEND SMS 2
+                               };
+
+unsigned int code LED1_Mode[] = {
+    ~0x0000,    //OFF (COMMAND MODE, GPRS OFF)
+    ~0x5555,    //DIAL
+    ~0x3333,    //PPP CONNECT/DISCONNECT
+    ~0x0F0F,    //TCP CONNECT
+    ~0xFFFF,    //HTTP WAIT
+    ~0x0001,    //SEND HEADER
+    ~0x0005,    //SEND DATA
+    ~0x0015,    //TCP DISCONNECT
+    ~0x0FF0     //COMMAND MODE, GPRS ON
+                                };
+
+unsigned int code LEDSTAT_Mode[] = {
+    ~0x0000,   //OFF
+    ~0xFFFF,   //ON
+    ~0x0080,   //NO RESPONSE FROM MODEM
+    ~0x0140,   //NO TEL NUMBERS
+    ~0x0490,   //SMS SEND UNSUCCESSFUL
+    ~0xFFFF    //MODEM INIT UNSUCCESSFUL
+                                   };
+
+unsigned char xdata StLED     = 0x02;
+unsigned char xdata StLED1    = 0x00;
+unsigned char xdata StLEDSTAT = 0x00;
+
+unsigned int xdata StSYSTEM   = 0x0000;
+// 0x0001 - USB power connected
+// 0x0002 - отправка SMS
+// 0x0004 - ожидание подтверждения SMS
+// 0x0008 - не исп.
+// 0x0010 - модем не отвечает
+// 0x0020 - не установлено необходимых тел. номеров
+// 0x0040 - неудачная отправка SMS
+// 0x0080 - ошибка инициализации модема
+// 0x0100 - дозвон GPRS
+// 0x0200 - не исп.
+// 0x0400 - TCP level
+// 0x0800 - соединение HTTP установлено
+// 0x1000 - HTTP, отправка данных               \
+// 0x2000 - HTTP, передача данных (send buffer) / 0x3000 - HTTP, передача данных (CTS busy)
+// 0x4000 - не исп.
+// 0x8000 - режим GPRS активен
+
+//маска XOR на вычисление контр. суммы данных журнала
+unsigned char xdata mLogCS = _MLOGCSDEFAULT_;
+
+
+
+
+void init_limits_data();
+
+void automat_leds()
+{
+    //*LED*
+    if (StSYSTEM & 0x0004)
+        StLED = 7;
+    else
+    if (StSYSTEM & 0x0002)
+        StLED = 6;
+    else
+    if (ForbiddenAll)
+        StLED = 2 | StSYSTEM & 0x0001;
+    else
+        StLED = 4 | StSYSTEM & 0x0001;
+    //*LED1*
+    if (StSYSTEM & 0x8000)
+        if (StSYSTEM & 0x0100)
+        {
+            //GPRS connect, GPRS active (PPP level)
+            if (StSYSTEM & 0x0400)
+                //TCP level
+                if (StSYSTEM & 0x0800)
+                    //HTTP level
+                    switch (StSYSTEM & 0x7000)
+                    {
+                        case 0x1000: StLED1 = 5; break;
+                        case 0x2000: StLED1 = 6; break;
+                        case 0x3000: StLED1 = 7; break;
+                            default: StLED1 = 4; break; //0, or incorrect state
+                    }
+                else
+                    //TCP connect
+                    StLED1 = 3;
+            else
+                //PPP connect/disconnect
+                StLED1 = 2;
+        }
+        else
+            //temporary command mode, GPRS stay active
+            StLED1 = 8;
+    else
+        if (StSYSTEM & 0x0100)
+            //dialing
+            StLED1 = 1;
+        else
+            //command mode, GPRS off
+            StLED1 = 0;        
+    //*LEDSTAT*
+    if (!(StSYSTEM & 0x00F0))
+        StLEDSTAT = 0;
+    else
+    if (StSYSTEM & 0x0010)
+        StLEDSTAT = 2;
+    else
+    if (StSYSTEM & 0x0080)
+        StLEDSTAT = 5;
+    else
+    if (StSYSTEM & 0x0020)
+        StLEDSTAT = 3;
+    else
+    if (StSYSTEM & 0x0040)
+        StLEDSTAT = 4;
+}
+
+
+void ReadFlash(unsigned char code * pread, unsigned int amount) //чтение дампа из Flash-ROM микроконтроллера
+//pread - начальный адрес считываемых данных (0x0..0x7FFF), доступ только в BANK0
+//amount - кол-во байт, назначение - буфер FlashDump[]
+{
+  unsigned int data i;
+  reset_wdt; //?
+    for (i=0; i<amount; i++) FlashDump[i] = *pread++;
+  reset_wdt; //?
+}
+
+void WriteFlash(unsigned char xdata * pwrite, unsigned int amount) //запись дампа в Flash-ROM микроконтроллера
+{
+  unsigned int data i;
+//0) Initialization
+    SFRPAGE = CONFIG_PAGE;
+    CCH0CN |= 0x01; //"Block Write Enable" (!!! amount должно быть кратно 4 !!!)
+    SFRPAGE = LEGACY_PAGE;
+  reset_wdt;
+//1) Erasing Flash Page:
+    FLSCL |= 0x01;
+  global_int_no;
+    PSCTL |= 0x03;
+    *pwrite = 0;
+    PSCTL &= 0xFD;
+  reset_wdt;
+//2) Writing Buffer to Flash:
+    for (i=0; i<amount; i++) *pwrite++ = FlashDump[i];
+  reset_wdt;
+    PSCTL &= 0xFE;
+  global_int_yes;
+    FLSCL &= 0xFE;
+}
+
+#ifdef GuardJTAG
+#pragma disable
+void LockJTAG() //установка байтов защиты от чтения/записи по JTAG
+{
+  unsigned char data c = PSBANK;
+    SFRPAGE = CONFIG_PAGE;
+    CCH0CN &= 0xFE; //"Block Write Disable"
+    SFRPAGE = LEGACY_PAGE;
+    PSBANK |= 0x30;
+    FLSCL |= 0x01;
+    PSCTL |= 0x01;
+    *((unsigned int xdata*)0xFBFE) = 0x0000;
+    PSCTL &= 0xFE;
+    FLSCL &= 0xFE;
+    PSBANK &= c; //return to Prev Bank
+}
+#endif
+
+void ReadScratchPad1() //чтение из ScratchPad (bank1) 128 байт в буфер FlashDump[]
+{
+  unsigned char data c = 0;
+  unsigned char code * pread = 0x0000;
+    SFRPAGE = LEGACY_PAGE;
+    PSCTL |= 0x04;
+    while (c < 128) FlashDump[c++] = *pread++;
+    PSCTL &= 0xFB;
+}
+
+void WriteScratchPad1() //запись в ScratchPad (bank1) 128 байт из буфера FlashDump[]
+{
+  unsigned char data c = 0;
+  unsigned char xdata * pwrite = 0x0000;
+//0) Initialization
+    SFRPAGE = CONFIG_PAGE;
+    CCH0CN |= 0x01; //"Block Write Enable"
+    SFRPAGE = LEGACY_PAGE;
+    PSCTL |= 0x04;
+  reset_wdt;
+//1) Erasing Flash Page:
+    FLSCL |= 0x01;
+  global_int_no;
+    PSCTL |= 0x03;
+    *pwrite = 0;
+    PSCTL &= 0xFD;
+  reset_wdt;
+//2) Writing Buffer to Flash:
+    while (c < 128) *pwrite++ = FlashDump[c++];
+    PSCTL &= 0xFA;
+  global_int_yes;
+    FLSCL &= 0xFE;
+}
+
+
+void WriteOutputData()
+//формирование одной выводимой точки (max = ...)
+//перед вызовом требуется установить pOutBuffer, *pFD
+{
+  unsigned char data i;
+  unsigned char xdata * pStream; //указатель на текущий буфер вывода
+
+    if (Auto_Enable) pStream = IOStreamBuf.OutAuto;
+    else pStream = IOStreamBuf.Out;
+
+                { for (i=0x00; i<=0x03; i++) pStream[IOBufPointer++] = pOutBuffer[i]; } //Time
+    if (FD.Sta) {      i=0x04;               pStream[IOBufPointer++] = pOutBuffer[i]; } //Status
+    if (FD.DrR) {      i=0x05;               pStream[IOBufPointer++] = pOutBuffer[i]; } //Dry s., Relays
+    if (FD.ADC) { for (i=0x06; i<=0x09; i++) pStream[IOBufPointer++] = pOutBuffer[i]; } //ADC inputs
+    if (FD.Sys) { for (i=0x0A; i<=0x0D; i++) pStream[IOBufPointer++] = pOutBuffer[i]; } //System par.
+    if (FD.Bl1) { for (i=0x0E; i<=0x43; i++) pStream[IOBufPointer++] = pOutBuffer[i]; } //Data Block1
+    if (FD.Bl2) { for (i=0x44; i<=0x79; i++) pStream[IOBufPointer++] = pOutBuffer[i]; } //Data Block2
+}
+
+unsigned char GetFDMask(union EVENTS EMask)
+//EMask - маска событий, по которой требуется найти маску формата данных
+//возвращается маска формата, которая затем должна быть записана в *pFD
+//перед вызовом установить pFD_Mask
+//бит CMask указывает, требуется ли сжатие маски EMask
+//если после вызова GetFDMask() CMask сброшен ("1"->"0"), маску сжать не удалось
+{
+unsigned char xdata cnt1;
+unsigned char xdata cnt2;
+unsigned char xdata Result = 0x00;
+unsigned char xdata tmp;
+
+  for (CMask_cnt=0,cnt1=0; cnt1<8; cnt1++)
+  {
+    tmp = EMask.c[cnt1];
+    if (tmp)
+      for (cnt2=0; cnt2<8; cnt2++)
+        if (tmp & (0x1 << cnt2))
+        {
+          Result |= pFD_Mask[Char = (cnt1 << 3) + cnt2];
+          if (CMask) //в SMS (0x31, 0x32) записываются маски событий
+          {
+            if (CMask_cnt >= 9) {CMask = 0; continue;} //маска запишется в несжатом виде + 1 байт
+            if (CMask_cnt) //не 0-й байт маски
+                CMask_buf[CMask_cnt-1] |= 0x80;
+            CMask_buf[CMask_cnt++] = Char;
+          }
+        }
+  }
+  return(Result);
+}
+
+void SetRdSearchRA() //запуск чтения точек в режиме RA
+{
+    BufAF = FlashDump; //назначение
+    ReadAF(); //старт
+
+    if (RdHeader.t.Byte == 0x00) RdHeader.t.Byte = 0x80;
+    else
+    {
+        RdHeader.t.Byte = 0x00;
+        if (RdHeader.t.Page < MaxPageAF) RdHeader.t.Page++;
+        else RdHeader.t.Page = 0x000;
+    }
+}
+
+void automat__RA() //только в режиме RA
+{
+    switch (State__RA)
+    {
+        case 0x01:
+            RdHeader.t.Page = RAA2 >> 2;
+            RdHeader.t.Byte = (RAA2 & 0x03) << 6;
+            pOutBuffer = &FlashDump;
+            RA_tmp = 0; //счетчик тревог в отправляемом SMS-сообщении
+            State__RA = 0x02;
+
+        case 0x02:
+        case 0x12:
+            //буфер вывода недоступен; выход...
+            if (IOBufPointer >= SizeBufOut)
+            {
+                IOStreamState.Out |= 0x9800;
+                return;
+            }
+            if (State__RA == 0x12)
+            {
+                //если SMS отправлено, переместить RAA2; учитываем, что в каждом следующем
+                //сообщении содержится хвост предыдущего, т.о. в RAA2 помещаем адрес
+                //последней точки переданного сообщения
+                State__RA = 0x02;
+                RAA2 = RAA1;
+                RA_cnt -= (RA_tmp-1);
+                RA_tmp = 1;
+            }
+            RAA1 = (RdHeader.t.Page << 2) | (RdHeader.t.Byte >> 6);
+            //чтение точки из журнала
+            SetRdSearchRA();
+            //проверка контр. суммы
+            for (Char=0,cnt=0; cnt<0x7F; cnt++) Char += FlashDump[cnt];
+            if ((Char ^ mLogCS) != FlashDump[0x7F]) //нет данных; окончание...
+            {
+                IOStreamState.Out &= 0xFF00;
+                IOStreamState.Out |= (0x9C00 | IOBufPointer); //немедленно очистить буфер
+                State__RA = 0xFF;
+                RA_Mode = 0;
+                return;
+            }
+            //если достигнут адрес, соотв. последней ключевой точке, точку передвинуть вперед
+            if (RAA3 == RAA1) RAA3 = (RdHeader.t.Page << 2) | (RdHeader.t.Byte >> 6);
+            //проверка на признак тревоги
+            if (FlashDump[0x04] & 0x80) RA_tmp++;
+            else return; //не тревога - пропуск точки
+            //формирование блока в буфере вывода
+            CMask = 1;
+            IOStreamBuf.Out[IOBufPointer++] = *pFD = GetFDMask(*pEvents);
+            if (CMask)
+                for (cnt=0; cnt<CMask_cnt; cnt++)
+                    IOStreamBuf.Out[IOBufPointer++] = CMask_buf[cnt];
+            else
+            {
+                IOStreamBuf.Out[IOBufPointer++] = 0xC0; //"маска без сжатия"
+                for (cnt=0; cnt<4; cnt++) IOStreamBuf.Out[IOBufPointer++] = (*pEvents).c[cnt];
+                for (cnt=0; cnt<4; cnt++) IOStreamBuf.Out[IOBufPointer++] = 0x00;
+            }
+            WriteOutputData();
+            //записываем длину "хвоста", если заполнен пакет SMS, уст. начало нового SMS
+            if (IOBufPointer >= SizeBufOut)
+            {
+                //записываем значение длины данных в буфере + "выслать SMS"
+                IOStreamState.Out &= 0xFF00;
+                IOStreamState.Out |= (0x9800 | IOBufPointer);
+                SMS_Tail[1] = IOBufPointer - SizeBufOut;
+                State__RA = 0x12;
+            }
+
+            return;
+
+        case 0xFF: //завершение
+            State__RA = 0x00;
+    }
+}
+
+void SetRdSearch() //установить параметры чтения для automat_search()
+{
+    //переход на следующий адрес
+    if (RdHeader.t.Byte) RdHeader.t.Byte = 0x00;
+    else
+    {
+        RdHeader.t.Byte = 0x80;
+        if (RdHeader.t.Page) RdHeader.t.Page--;
+        else RdHeader.t.Page = MaxPageAF;
+    }
+
+    BufAF = FlashDump; //назначение
+    ReadAF(); //старт
+}
+
+void automat_search()
+//исходные данные:
+//Search1.XXX - начальная точка отсчета по времени
+//Search2.XXX - конечная --||--
+//MaskEvents.X.XXX - маска битов поиска (по ИЛИ)
+//AmountSearchPoints - максимальное количество находимых точек
+{
+unsigned char data i;
+
+  if (IOBufPointer >= SizeBufOut) IOStreamState.Out |= 0x8000;
+
+  switch (StateSearch)
+  {
+    case 0x00: //старт поиска
+
+        RdHeader.l = WrHeader.l; //начать с последней записанной точки
+        pOutBuffer = &FlashDump;
+
+        StateSearch = 0x01;
+        return;
+
+    case 0x01: //поиск верхнего значения по времени...
+
+        //буфер вывода недоступен; выход...
+        if (IOStreamState.Out & 0x8000) return;
+
+        SetRdSearch();
+
+        //проверка контр. суммы
+        for (Char=0, i=0; i<0x7F; i++) Char += FlashDump[i];
+        if ((Char ^ mLogCS) != FlashDump[0x7F]) //нет данных; окончание...
+        {
+            StateSearch = 0x03;
+            return;
+        }
+
+        if (*pTimeL > Search2_Time) return; //двигаемся дальше...
+
+    case 0x02: //поиск по маске; нижнего значения по времени...
+
+        //буфер вывода недоступен; выход...
+        if (IOStreamState.Out & 0x8000) return;
+
+        if (StateSearch == 0x02) SetRdSearch();
+        else StateSearch = 0x02;
+
+        //проверка контр. суммы
+        for (Char=0, i=0; i<0x7F; i++) Char += FlashDump[i];
+        if ((Char ^ mLogCS) != FlashDump[0x7F]) //нет данных; окончание...
+        {
+            StateSearch = 0x03;
+            return;
+        }
+
+        if (*pTimeL < Search1_Time) //поиск окончен по времени...
+        {
+            StateSearch = 0x03;
+            return;
+        }
+
+        //поиск по битовой маске...
+        if (((*pEvents).l.l1 & MaskEvents.l.l1) || //i.e. subset
+            ((*pEvents).l.l2 & MaskEvents.l.l2))
+        {
+            //переписываем в буфер в/в текущую точку согласно установленному формату FD
+            //опр. формат FD для текущей точки и помещаем его в буфер вывода
+
+            if (Auto_Enable) //!for GPRS only!
+            {
+                if (!gprs.b.abs_off) IOStreamState.Out |= 0x0100; //for GPRS
+                pChar = IOStreamBuf.OutAuto;
+                CMask = 0; //без сжатия
+                *pFD = 0x3F;
+            }
+            else
+            {
+                pChar = IOStreamBuf.Out;
+                CMask = 0; //без сжатия
+                *pFD = 0x3F;
+                //pChar[IOBufPointer++] = *pFD = GetFDMask(*pEvents);
+            }
+
+            if (CMask)
+                for (cnt=0; cnt<CMask_cnt; cnt++) pChar[IOBufPointer++] = CMask_buf[cnt];
+            else
+            {
+                pChar[IOBufPointer++] = 0xC0; //"маска без сжатия"
+                for (cnt=0; cnt<4; cnt++) pChar[IOBufPointer++] = (*pEvents).c[cnt];
+                for (cnt=0; cnt<4; cnt++) pChar[IOBufPointer++] = 0x00;
+            }
+
+            WriteOutputData();
+
+            //if (Auto_Enable) //без хвостов
+            {
+                IOStreamState.Out &= 0xFF00;
+                IOStreamState.Out |= (0x8400 | IOBufPointer);
+                SMS_Tail[1] = 0;
+            }
+            /*else
+            //записываем длину "хвоста", если заполнен пакет SMS, уст. начало нового SMS
+            if (IOBufPointer >= SizeBufOut)
+            {
+                //записываем значение длины данных в буфере + "выслать SMS"
+                IOStreamState.Out &= 0xFF00;
+                IOStreamState.Out |= (0x8000 | IOBufPointer);
+                SMS_Tail[1] = IOBufPointer - SizeBufOut;
+            }*/
+
+            //увеличиваем кол. найденных точек...
+            if (++CountSearchPoints >= AmountSearchPoints) //весь массив заполнен... выход
+            {
+                if (Auto_Enable==0) IOStreamState.Out &= 0x7FFF; //(последний пакет 0x31/0x3D)
+                StateSearch = 0x03;
+            }
+        }
+
+        //двигаемся дальше...
+        return;
+
+    case 0x03: //завершение работы автомата
+
+        //записываем значение длины данных в буфере
+        IOStreamState.Out &= 0xFF00;
+        IOStreamState.Out |= IOBufPointer;
+
+        SearchEnable = 0;
+        StateSearch = 0x00;
+  }
+}
+
+bit Test_In_CS()
+{
+  unsigned char data c = 0;
+  unsigned int xdata CS = 0;
+
+    for ( ; c<138; c++) CS += IOStreamBuf.In[c];
+    if (CS != *((unsigned int xdata*)(&IOStreamBuf.In[138]))) return 0;
+    return 1;
+}
+
+unsigned int xdata RNext; //доп. параметр для больших запросов
+
+void automat_request() //обработка запросов с ЦДП
+{
+unsigned char data i;
+unsigned int xdata CheckSum;
+
+    switch (StateRequest)
+    {
+        case 0x00: //ожидание запроса
+
+            if (IOStreamState.In & 0x8000) //пришел запрос
+            {
+                IOStreamState.ReqID = IOStreamBuf.In[0];
+                StateRequest = 0x01; //требуется ответ на ЦДП
+            }
+
+            return;
+
+        case 0x01: //подготовительные операции
+
+            if (IOStreamState.Out & 0x4000) return; //в данный момент параметры используются
+                                                    //при выводе SMS и не должны изменяться!
+            saveIOBufPointer = IOBufPointer;
+            saveIOStreamStateOut = IOStreamState.Out;
+            saveSMS_Tail = *(pInt = SMS_Tail);
+            *pInt = 0x0000;
+
+            if (RestoreSearch = SearchEnable) //работает поиск; сохранить все параметры поиска
+            {
+                saveRdHeader = RdHeader.l;
+                saveStateSearch = StateSearch;
+                saveSearch2Time = Search2_Time;
+                saveAmountSearchPoints = AmountSearchPoints;
+                saveCountSearchPoints = CountSearchPoints;
+
+                SearchEnable = 0;
+            }
+            
+            Auto_Enable = 0;
+            //информация о режиме
+            if (RM_Enable)
+                RNext = IOStreamState.Out = 0x2200;
+            else
+                RNext = IOStreamState.Out = 0x2000 | IOStreamState.In & 0x0300;
+
+            switch (IOStreamState.ReqID) //проверить тип запроса
+            {
+                case 0x31: case 0x3D: case 0x4F: case 0x51:
+                case 0x33: case 0x35: case 0x37:
+                case 0x03: case 0x0B: case 0x0F: case 0x5B: case 0x53:
+                case 0x41:
+                case 0x43: case 0x45: case 0x47:
+                case 0x4D:
+                case 0xDB: case 0x4B:
+                case 0x7B:
+                    StateRequest = IOStreamState.ReqID;
+                break;
+
+                default: //неизвестный тип запроса - не обрабатывается
+                    IOStreamState.In = 0x0000; //сброс; теперь возможен прием нового запроса
+                    IOStreamState.Out |= 0x8400; //выдать пустой буфер
+                    StateRequest = 0xFF; //окончание
+            }
+
+            return;
+
+        case 0x3D: //запрос на чтение данных из журнала
+        case 0x31: //запрос на чтение данных из журнала
+
+            if (!Test_In_CS()) {StateRequest = 0xCC; return;}
+
+            Char = 1; //последовательный счетчик; нач. значение соотв. байту N1
+
+            for (i=0; i<8; i++) MaskEvents.c[i] = IOStreamBuf.In[Char++];
+
+            for (i=0; i<64; i++) FD_Req[i] = IOStreamBuf.In[Char++];
+
+            if (AmountSearchPoints = IOStreamBuf.In[Char++]);
+            else AmountSearchPoints = 65535; //если "0" - вывести максимальное кол-во точек
+            CountSearchPoints = 0;
+
+            //преобразование из формата TSIP в абс. значение (unsigned long), [сек]
+            pChar = &Float;
+            for (i=0; i<4; i++) *pChar++ = IOStreamBuf.In[Char++];
+            pChar = &Int;
+            for (i=0; i<2; i++) *pChar++ = IOStreamBuf.In[Char++];
+            Search1_Time = (unsigned long)Int*604800L + (unsigned long)Float;
+
+            //преобразование из формата TSIP в абс. значение (unsigned long), [сек]
+            pChar = &Float;
+            for (i=0; i<4; i++) *pChar++ = IOStreamBuf.In[Char++];
+            pChar = &Int;
+            for (i=0; i<2; i++) *pChar++ = IOStreamBuf.In[Char++];
+            Search2_Time = (unsigned long)Int*604800L + (unsigned long)Float;
+
+            IOStreamState.In = 0x0000; //сброс; теперь возможен прием нового запроса
+
+            StateRequest = 0x02;
+            return;
+
+        case 0x02: //вывести текущие данные, не записанные в журнал
+        case 0x09: //--||-- и завершить обработку запроса
+            
+            IOBufPointer = 0;
+
+            pFD_Mask = FD_Req;
+            pOutBuffer = DataLogger;
+            CMask = 0; //сжатие маски не выполняется
+            *pFD = GetFDMask(MaskEvents);
+
+            //1) состояние на текущий момент
+            IOStreamBuf.Out[IOBufPointer++] = *pFD; //формат
+            //"нет событий"
+            IOStreamBuf.Out[IOBufPointer++] = 0x40;
+
+            WriteOutputData();
+
+            IOStreamState.Out &= 0xFF00;
+            IOStreamState.Out |= (0xA400 | IOBufPointer); //немедленно очистить буфер
+
+            if (StateRequest != 0x02) //запрос 0x31/0x3D ужЕ обработан
+            {
+                StateRequest = 0xFF;
+                return;
+            }
+
+            StateSearch = 0x00; //на начало поиска
+            SearchEnable = 1; //старт
+
+            StateRequest = 0x08;
+            return;
+
+        case 0x33: //команда установки масок mLogger, mAuto, mAlarm и параметров событий LimitsData
+
+            if (!Test_In_CS()) {StateRequest = 0xCC; return;}
+
+            CountAuto = StateSearch = 00; //предыдущие точки авторежима не выводить
+            RestoreSearch = 0; //(?)
+
+            //чтение данных профиля 0x33 и 0x35 в буфер
+            ReadFlash(F_ADDR_SETUP, 260); //130 + 130
+
+            Char = 0;
+            for (i=0; i<8; i++) mLogger.c[i] = FlashDump[Char-1] = IOStreamBuf.In[++Char];
+            for (i=0; i<8; i++) mAuto.c[i] = FlashDump[Char-1] = IOStreamBuf.In[++Char];
+            for (i=0; i<8; i++) mAlarm.c[i] = FlashDump[Char-1] = IOStreamBuf.In[++Char];
+            for (i=0; i<lim_SIZE; i++) LimitsData.All[i] = FlashDump[Char-1] = IOStreamBuf.In[++Char];
+            for ( ; Char < 130; ) FlashDump[Char-1] = IOStreamBuf.In[++Char]; //?
+
+            init_limits_data(); //доп. инициализации новых установленных параметров
+
+            reset_wdt;
+            WriteFlash(F_ADDR_SETUP, 260);
+            reset_wdt;
+
+            IOStreamState.In = 0x0000; //сброс; теперь возможен прием нового запроса
+            StateRequest = 0x05;
+            return;
+
+        case 0x35: //команда установки масок формата вывода данных FD_Auto, FD_Alarm
+
+            if (!Test_In_CS()) {StateRequest = 0xCC; return;}
+
+            //чтение данных профиля 0x33 и 0x35 в буфер
+            ReadFlash(F_ADDR_SETUP, 260); //130 + 130
+
+            Char = 0;
+            for (i=0; i<64; i++)
+            {
+                FD_Auto[i] = FlashDump[Char+129] = IOStreamBuf.In[++Char];
+                FD_Alarm[i] = FlashDump[Char+129] = IOStreamBuf.In[++Char];
+            }
+            FlashDump[258] = IOStreamBuf.In[129];
+            FlashDump[259] = IOStreamBuf.In[130];
+
+            reset_wdt;
+            WriteFlash(F_ADDR_SETUP, 260);
+            reset_wdt;
+
+            IOStreamState.In = 0x0000; //сброс; теперь возможен прием нового запроса
+            StateRequest = 0x05;
+            return;
+
+        case 0x0B: //смена номеров SMS- и диспетчерских центров
+
+            if (!Test_In_CS()) {StateRequest = 0xCC; return;}
+
+            // если нет номеров, то менять их не будем
+            if (Test_tel_to_phone(&IOStreamBuf.In[0]))
+            {
+                for (i=0; i<10; i++) Write_tel_to_phone (i, &IOStreamBuf.In[i*12]);
+                // Если каких-то номеров нет, то заполняем их теми номерами, что есть.
+                Analise_tel_num();
+
+                if (IOStreamBuf.In[121]!=0xFF)
+                {
+                    sec_for_numtel = IOStreamBuf.In[121] & 7;
+                    //Сохранить во флеше "маску проверки входящих команд по номеру телефона"
+                    ReadScratchPad1();
+                    FlashDump[8] = 'S'; 
+                    FlashDump[9] = sec_for_numtel;
+                    WriteScratchPad1();
+                }
+            }
+
+            StateRequest = 0x03;
+            return;
+
+        case 0x0F: //сброс терминала
+
+            if (!Test_In_CS()) {StateRequest = 0xCC; return;}
+
+            if (IOStreamBuf.In[1]==0x1F)
+            {
+                ReadScratchPad1();
+                FlashDump[5] = 0xAA;
+                WriteScratchPad1();
+            }
+            if (RM_Enable) StRM.b.fNeedRst = 1;
+            else _flag_need_do_restart = 1;
+
+            StateRequest = 0x03;
+            return;
+
+        case 0x03: //диагностика
+
+            if (IOStreamState.ReqID == 0x03)
+                if (!Test_In_CS()) {StateRequest = 0xCC; return;}
+
+            IOBufPointer = 0;
+            IOStreamState.In = 0x0000; //сброс; теперь возможен прием нового запроса
+
+            IOBufPointer = do_pack030F(&IOStreamBuf.Out);
+            IOStreamState.Out |= (0xA400 | IOBufPointer); //немедленно очистить буфер
+
+            StateRequest = 0xFF;
+            return;
+
+        case 0x53: //запрос номеров (10 дополнительтных)
+
+            if (!Test_In_CS()) {StateRequest = 0xCC; return;}
+
+            IOStreamState.In = 0x0000; //сброс; теперь возможен прием нового запроса
+            IOBufPointer = do_pack53(&IOStreamBuf.Out);
+            IOStreamState.Out |= (0xA400 | IOBufPointer); //немедленно очистить буфер
+            StateRequest = 0xFF;
+            return;
+
+        case 0x5B: //смена  номеров (10 дополнительтных)
+            if (!Test_In_CS()) {StateRequest = 0xCC; return;}
+            for (i=0; i<10; i++) Write_tel_to_phone (i+11, &IOStreamBuf.In[i*12]);
+            //Analise_10d_tel_num(); // Анализ 10 дополнительных номеров
+            if (IOStreamBuf.In[121]!=0xFF)
+            {
+                sec_for_numtel = IOStreamBuf.In[121] & 7;
+                // Нужно сохранить во флеше "маску проверки входящих команд по номеру телефона"
+                ReadScratchPad1();
+                FlashDump[8] = 'S'; 
+                FlashDump[9] = sec_for_numtel;
+                WriteScratchPad1();
+            }
+            IOStreamState.In = 0x0000; //сброс; теперь возможен прием нового запроса
+            IOBufPointer = do_pack53(&IOStreamBuf.Out);
+            IOStreamState.Out |= (0xA400 | IOBufPointer); //немедленно очистить буфер
+            StateRequest = 0xFF;
+            return;
+
+        case 0x41: //'A'
+            time_wait_txtsms=0;
+            StateRequest = 0x10;
+
+        case 0x10:
+            if (time_wait_txtsms>1)
+            {
+                i = (unsigned char)((IOStreamState.In & 0x0300)==0x0100); // GPRS?
+                switch (IOStreamBuf.In[1+i])
+                {
+                    case 1:// Постановка/снятие, Cтатус
+                        IOBufPointer = do_txtpack_S(&IOStreamBuf.Out,i);
+                    break;
+                    case 2:// вернуть Ok
+                        IOBufPointer = do_txtpack_T(&IOStreamBuf.Out,i,0);
+                    break;
+                    case 4:// смена пароля
+                        IOBufPointer = do_txtpack_P(&IOStreamBuf.Out,i);
+                    break;
+                    case 5:// основные номера
+                        IOBufPointer = do_txtpack_N(&IOStreamBuf.Out,i);
+                    break;
+                    case 6:// номер версии
+                        IOBufPointer = do_txtpack_V(&IOStreamBuf.Out,i);
+                    break;
+                    case 7:// Текстовый рестарт
+                        IOBufPointer = do_txtpack_T(&IOStreamBuf.Out,i,1);
+                    break;
+                }
+
+                IOStreamState.In = 0x0000; //сброс; теперь возможен прием нового запроса
+
+                IOStreamState.Out |= (0xA400 | IOBufPointer); //немедленно очистить буфер
+
+                IOStreamState.ReqID = 0x20;
+
+                StateRequest = 0xFF;
+            }
+            return;
+
+        case 0x43: //возврат на ЦДП данных, записываемых по команде 0x33; ответ на запрос 0x33
+
+            IOBufPointer = 0;
+
+            //сюда попадаем также из StateRequest == 0x05 (IOStreamState.ReqID == 0x33)
+            if (IOStreamState.ReqID == 0x43)
+            {
+                if (!Test_In_CS()) {StateRequest = 0xCC; return;}
+                IOStreamState.In = 0x0000; //сброс; теперь возможен прием нового запроса
+            }
+            else //(IOStreamState.ReqID == 0x33); профиль 0x33 <не Default> записан
+                DefaultProfile = 0;
+
+            for (i=0; i<8; i++) IOStreamBuf.Out[IOBufPointer++] = mLogger.c[i];
+            for (i=0; i<8; i++) IOStreamBuf.Out[IOBufPointer++] = mAuto.c[i];
+            for (i=0; i<8; i++) IOStreamBuf.Out[IOBufPointer++] = mAlarm.c[i];
+            for (i=0; i<lim_SIZE; i++) IOStreamBuf.Out[IOBufPointer++] = LimitsData.All[i];
+
+            IOStreamState.Out |= (0xA400 | IOBufPointer); //немедленно очистить буфер
+
+            StateRequest = 0xFF;
+            return;
+
+        case 0x45: //возврат на ЦДП данных, записываемых по команде 0x35; ответ на запрос 0x35
+
+            IOBufPointer = 0;
+
+            //сюда попадаем также из StateRequest == 0x05 (IOStreamState.ReqID == 0x35)
+            if (IOStreamState.ReqID == 0x45)
+            {
+                if (!Test_In_CS()) {StateRequest = 0xCC; return;}
+                IOStreamState.In = 0x0000; //сброс; теперь возможен прием нового запроса
+            }
+
+            for (i=0; i<64; i++)
+            {
+                IOStreamBuf.Out[IOBufPointer++] = FD_Auto[i];
+                IOStreamBuf.Out[IOBufPointer++] = FD_Alarm[i];
+            }
+
+            IOStreamState.Out |= (0xA400 | IOBufPointer); //немедленно очистить буфер
+
+            StateRequest = 0xFF;
+            return;
+
+        //продолжение обработки запроса 0x31
+        case 0x08: //окончание обработки
+
+            pFD_Mask = FD_Req; //?
+            if (SearchEnable) {IOStreamState.Out |= RNext; return;} //поиск...
+            //поиск окончен
+            if (IOStreamState.Out & 0x4000) return; //параметры заблокированы
+            if (IOStreamState.Out & 0x00FF) //в буфере есть данные
+            {
+                IOStreamState.Out |= 0x8400 | RNext; //немедленно очистить буфер
+                StateRequest = 0xFF;
+                return;
+            }
+            //в буфере нет данных - записать текущую позицию
+            StateRequest = 0x09;
+            return;
+
+        //продолжение обработки запросов 0x33, 0x35
+        case 0x05: //чтение профиля из Flash и ответ на ЦДП
+
+            //вычисление и проверка контрольной суммы;
+            //если запись прошла нормально, выдать ответ аналогичный пакету 0x4X
+            //1) проверка контр. суммы 1-й части профиля (0x33)
+            ReadFlash(F_ADDR_SETUP, 130);
+            for (CheckSum=0, i=0; i<128; i++) CheckSum += FlashDump[i];
+            if (CheckSum != ((FlashDump[128] << 8) | FlashDump[129])) Char = 1; else Char = 0;
+            reset_wdt;
+            //2) проверка контр. суммы 2-й части профиля (0x35)
+            ReadFlash(F_ADDR_SETUP+130, 130);
+            for (CheckSum=0, i=0; i<128; i++) CheckSum += FlashDump[i];
+            if (CheckSum != ((FlashDump[128] << 8) | FlashDump[129])) Char |= 0x2;
+            //3) выдать ответ об ошибке
+            if (IOStreamState.ReqID == 0x33)
+            {
+                if (Char & 0x1)
+                {
+                    IOStreamBuf.Out[0] = 0x33; //код невыполненного запроса
+                    IOStreamBuf.Out[1] = 0xCE; //код ошибки
+                    IOStreamBuf.Out[2] = 0x35;
+                    IOStreamBuf.Out[3] = (Char & 0x2) ? 0xCE : 0x00; //код ошибки
+                    IOStreamState.ReqID = 0x3F; //ответ об ошибке
+                    IOStreamState.Out |= 0xA404; //немедленно очистить буфер
+                    StateRequest = 0xFF;
+                    return;
+                }
+                StateRequest = 0x43;
+            }
+            else
+            {
+                if (Char & 0x2)
+                {
+                    IOStreamBuf.Out[0] = 0x35; //код невыполненного запроса
+                    IOStreamBuf.Out[1] = 0xCE; //код ошибки
+                    IOStreamBuf.Out[2] = 0x33;
+                    IOStreamBuf.Out[3] = (Char & 0x1) ? 0xCE : 0x00; //код ошибки
+                    IOStreamState.ReqID = 0x3F; //ответ об ошибке
+                    IOStreamState.Out |= 0xA404; //немедленно очистить буфер
+                    StateRequest = 0xFF;
+                    return;
+                }
+                StateRequest = 0x45;
+            }
+
+            return;
+
+        case 0x4D: //Управление реле и постановка/снятие на/с охраны
+
+            if (!Test_In_CS()) {StateRequest = 0xCC; return;}
+
+            UprRele(&IOStreamBuf.In[1]);
+
+            time_wait_txtsms = 0;
+
+            StateRequest = 0x7F; //вывести текущее состояние МТА
+            return;
+
+        case 0x37: //Установка дополнительных параметров
+
+            if (!Test_In_CS()) {StateRequest = 0xCC; return;}
+
+            //do_pack37();
+            reset_wdt;
+            //do_pack47();
+
+            IOStreamState.In = 0x0000; //сброс; теперь возможен прием нового запроса
+
+            StateRequest = 0xFF;
+            return;
+
+        case 0x47: //Чтение дополнительных параметров
+
+            if (!Test_In_CS()) {StateRequest = 0xCC; return;}
+
+            //do_pack47();
+
+            IOStreamState.In = 0x0000; //сброс; теперь возможен прием нового запроса
+
+            StateRequest = 0xFF;
+            return;
+/*
+        case 0x4B: //команда настройки (GPRS)
+            _f_SMS_noanswer=0;
+            if (Test_read_text(&IOStreamBuf.In[5])==1)
+            {         
+                if (IOStreamBuf.In[6]==0x01) // Постановка/снятие, Cтатус
+                    IOBufPointer = do_txtpack_S(&IOStreamBuf.Out);
+
+                if (IOStreamBuf.In[6]==0x02) // вернуть Ok
+                    IOBufPointer = do_txtpack_Ok(&IOStreamBuf.Out);
+
+                if (IOStreamBuf.In[6]==0x04) // смена пароля
+                    IOBufPointer = do_txtpack_P(&IOStreamBuf.Out);
+
+                if (IOStreamBuf.In[6]==0x05) // основные номера
+                    IOBufPointer = do_txtpack_N(&IOStreamBuf.Out);
+
+                IOStreamState.Out = (0xA500 | IOBufPointer); //немедленно очистить буфер
+            }
+            else
+                IOStreamState.Out = 0x0000;
+
+            IOStreamState.In = 0x0000; //сброс; теперь возможен прием нового запроса
+
+            StateRequest = 0xFF;
+            return;
+*/
+        case 0xCC: //Неверная контрольная сумма
+
+            //ошибка контрольной суммы - пропуск дальнейших действий, выдача сообщения об ошибке
+            IOStreamState.Out |= 0xA402; //немедленно очистить буфер (2 байта)
+            IOStreamBuf.Out[0] = IOStreamState.ReqID; //код невыполненного запроса
+            IOStreamBuf.Out[1] = 0xCC; //код ошибки (0xCC "ошибка контр. суммы")
+            IOStreamState.ReqID = 0x3F; //ответ об ошибке
+
+            IOStreamState.In = 0x0000; //сброс; теперь возможен прием нового запроса
+            StateRequest = 0xFF;
+            return;
+
+        case 0xFF: //завершение
+            
+            if (IOStreamState.Out & 0x8000) return; //пока не очищен буфер...
+
+            //восстановить все параметры авторежима и поиска
+            IOBufPointer = saveIOBufPointer;
+            IOStreamState.Out = saveIOStreamStateOut;
+            *(pInt = SMS_Tail) = saveSMS_Tail;
+            Auto_Enable = 1;
+            RM_Enable = 0;
+            if (RestoreSearch) //был прерван поиск; восстановить состояние поиска
+            {
+                SearchEnable = 1;
+
+                RdHeader.l = saveRdHeader;
+                StateSearch = saveStateSearch;
+                Search1_Time = 0L;
+                Search2_Time = saveSearch2Time;
+                MaskEvents.l.l1 = mAuto.l.l1;
+                MaskEvents.l.l2 = mAuto.l.l2;
+                AmountSearchPoints = saveAmountSearchPoints;
+                CountSearchPoints = saveCountSearchPoints;
+
+                pFD_Mask = FD_Auto;
+            }
+            pOutBuffer = FlashDump;
+
+            IOStreamState.ReqID = 0x00;
+
+            StateRequest = 0x00;
+            return;
+
+        case 0x51: //короткий запрос по радиомодему
+        case 0x7F: //вывести текущее состояние МТА
+          default: //"online" (0x4F), или неизвестный тип запроса
+
+            if (time_wait_txtsms <= 1) return;
+
+            IOStreamBuf.Out[0] = 0xC0; //"маска без сжатия"
+            for (IOBufPointer=1,cnt=0; cnt<8; cnt++) IOStreamBuf.Out[IOBufPointer++] = mResult.c[cnt];
+            *pFD = 0x3F;
+            pOutBuffer = DataLogger; //из буфера журнала
+            WriteOutputData(); //записать одну точку
+
+            IOStreamState.In = 0x0000; //сброс; теперь возможен прием нового запроса
+            IOStreamState.Out |= (0xA400 | IOBufPointer); //немедленно очистить буфер
+
+            StateRequest = 0xFF;
+            return;
+
+        case 0x7B: //"7-bit" (GPRS)
+            if (Test_read_text(&IOStreamBuf.In[1])) // Обработка принятого сообщения
+            {
+               _f_SMS_noanswer=0;
+                StateRequest = 0x41;
+            }
+            else
+            {
+                IOStreamState.In = 0x0000; //сброс; теперь возможен прием нового запроса
+                StateRequest = 0xFF;
+            }
+        break;
+    } //switch (StateRequest)
+} //void automat_request()
+
+void automat_alarm()
+{
+    switch (StateAlarm)
+    {
+        case 0x00: //начать обработку тревоги
+
+            if (StateSendSMS & 0x40) return; //в данный момент отправляется тревога
+
+            if (StateSendSMS & 0x04) //тревога потеряна - переключиться в режим RA
+            {
+                StateSendSMS &= 0xFB;
+                if (RA_Mode == 0)
+                {
+                    RA_Mode = 1;
+                    RA_cnt += RA_tmp;
+                    TimeRA = 0; //начать отсчет интервалов между попытками передачи тревог
+                    StateAlarm = 0x11;
+                    return;
+                }
+            }
+
+            if (Alarm_Enable)
+            //в режиме RA, при появлении возможности выдачи SMS сообщений,
+            //требуется установить бит Alarm_Enable, оставив Lock_DataRAM в "0"
+            if (RA_Mode) StateAlarm = 0x21; //запустить восстановление потерянных тревог
+            else StateAlarm = 0x01; //обычный режим - отсылка новой тревоги
+
+            return;
+
+        case 0x11:
+
+            //Записать в Flash контроллера флаг RA_Mode, адрес RAA2, счетчик RA_cnt
+            //RA_Mode: Scratchpad FLASH Memory, адрес [05], значение 0x55
+            //RAA2   : Scratchpad FLASH Memory, адрес [06:07]
+            //RA_cnt  : Scratchpad FLASH Memory, адрес [10]
+            ReadScratchPad1();
+            FlashDump[5] = 0x55;
+            *(pInt = &FlashDump[6]) = RAA2;
+            FlashDump[10] = RA_cnt;
+            WriteScratchPad1();
+
+            AlarmEvents.l.l1 = AlarmEvents.l.l2 = 0;
+            Lock_DataRAM = Alarm_Enable = 0;
+            StateAlarm = 0x00;
+            return;
+
+        case 0x21: //сохранение параметров авторежима
+        case 0x01: //--||--
+            
+            if (IOStreamState.Out & 0x4000) return; //в данный момент параметры используются
+                                                    //при выводе SMS и не должны изменяться!
+            //запомнить длину буфера авторежима (на этот момент авторежим включен)
+            saveIOBufPointer = IOBufPointer;
+            saveIOStreamStateOut = IOStreamState.Out;
+            saveSMS_Tail = *(pInt = SMS_Tail);
+            *pInt = 0x0000;
+
+            if (RestoreSearch = SearchEnable) //работает поиск; сохранить параметры поиска
+            {
+                saveRdHeader = RdHeader.l;
+                SearchEnable = 0;
+            }
+
+            Auto_Enable = 0;
+            //IOStreamState.Out = (gprs.b.abs_off ? 0x1000 : 0x1100); //информация о режиме
+            IOStreamState.Out = 0x1000;
+
+            StateAlarm++; //0x01->0x02; 0x21->0x22
+            return;
+
+        case 0x02: //установка нач. значений
+            
+            IOBufPointer = 0;
+
+            //последняя записанная точка выводится первой
+            if (DataRAMPointer) pOutBuffer = &DataRAM[DataRAMPointer - (AlarmPointSize+8)];
+            else pOutBuffer = &DataRAM[(AlarmPointSize+8)*(AMOUNT_DATARAM_POINTS-1)];
+
+            pFD_Mask = FD_Alarm;
+            AlarmPointNum = AmountAlarmPoints;
+
+            IOStreamState.Out |= 0x1000; //"тревога"
+
+            StateAlarm = 0x03;
+            return;
+
+        case 0x03: //запись одной точки в буфер вывода
+
+            pEvents = pOutBuffer + AlarmPointSize;
+            if (((*pEvents).l.l1==0x0000) && ((*pEvents).l.l2==0x0000))
+            {
+                CMask = 0;
+                IOStreamBuf.Out[IOBufPointer++] = *pFD = GetFDMask(AlarmEvents);
+                IOStreamBuf.Out[IOBufPointer++] = 0x40; //"нет событий"
+            }
+            else
+            {
+                CMask = 1;
+                IOStreamBuf.Out[IOBufPointer++] = *pFD = GetFDMask(*pEvents);
+                if (CMask)
+                    for (cnt=0; cnt<CMask_cnt; cnt++)
+                        IOStreamBuf.Out[IOBufPointer++] = CMask_buf[cnt];
+                else
+                {
+                    IOStreamBuf.Out[IOBufPointer++] = 0xC0; //"маска без сжатия"
+                    for (cnt=0; cnt<8; cnt++) IOStreamBuf.Out[IOBufPointer++] = (*pEvents).c[cnt];
+                }
+            }
+
+            WriteOutputData();
+
+            if (pOutBuffer == DataRAM) pOutBuffer = &DataRAM[(AlarmPointSize+8)*(AMOUNT_DATARAM_POINTS-1)];
+            else pOutBuffer -= (AlarmPointSize+8);
+
+            if ((--AlarmPointNum) && (IOBufPointer < SizeBufOut)) return;
+
+            if (AlarmEvents.b.reset_cpu)
+            {
+                if (StK8.b.fTabMode) //Если подключено табло, пакет с рестартом заменяется
+                                     // на текстовое сообщение! Вместо тревоги формируется
+                                     // запрос 0x41
+                {
+                    _f_SMS_noanswer = 0;
+                    io_who_send_sms = 1; //отправка рестарта на номер DC1
+                    IOStreamBuf.In[0] = 0x41;
+                    IOStreamBuf.In[1] = 0x07;
+                    IOStreamState.In = 0x8002;
+                    IOStreamState.Out = 0x0000;
+                }
+                else
+                {
+                    //начальный адрес записи в журнал и источник рестарта процессора:
+                    if (IOBufPointer < SizeBufOut)
+                    {
+                        IOStreamBuf.Out[IOBufPointer++] = WrHeader.c[1];
+                        IOStreamBuf.Out[IOBufPointer++] = WrHeader.c[2];
+                        IOStreamBuf.Out[IOBufPointer++] = WrHeader.c[3];
+                        SFRPAGE = LEGACY_PAGE;
+                        IOStreamBuf.Out[IOBufPointer++] = RSTSRC; //Reset Source Register
+                        IOStreamBuf.Out[IOBufPointer++] = reset_code; //Reset Code State
+                        reset_code = 0x01; //рестарт, не вызываемый программой напрямую
+                    }
+                    IOStreamState.Out |= (0x9400 | IOBufPointer); //тревога записана; очистить буфер
+                }
+            }
+            else
+                IOStreamState.Out |= (0x9400 | IOBufPointer); //тревога записана; очистить буфер
+
+            AlarmEvents.l.l1 = AlarmEvents.l.l2 = 0;
+
+            Lock_DataRAM = 0; //разблокировать буфер тревоги
+            
+            RAA2 = RAA1;
+            RA_cnt = RA_tmp;
+            RA_tmp = 0;
+
+            StateAlarm = 0xFF;
+            return;
+
+        case 0x22: //запрос на чтение из журнала
+
+            IOBufPointer = 0;
+
+            pFD_Mask = FD_Alarm;
+
+            IOStreamState.Out |= 0x1800; //автовосстановление тревог ("RA")
+            State__RA = 0x01; //старт автомата
+
+            //...RA_Mode==1...
+
+            StateAlarm = 0x23;
+            return;
+
+        case 0x23: //поиск...
+
+            //(используется буфер вывода IOStreamBuf.Out)
+            if (IOStreamState.Out & 0xC000) return;
+            if (StateSendSMS & 0x10) return; //SMS в стадии отправки
+            if (StateSendSMS & 0x01) //SMS отправить не удалось
+            {
+                StateSendSMS &= 0xFE;
+                RA_Mode = 1;
+                TimeRA = 0;
+
+                ReadScratchPad1();
+                FlashDump[5] = 0x55;
+                *(pInt = &FlashDump[6]) = RAA2;
+                FlashDump[10] = RA_cnt;
+                WriteScratchPad1();
+
+                Lock_DataRAM = 0;
+                State__RA = 0x00;
+                StateAlarm = 0xFF;
+                return;
+            }
+            automat__RA(); //поиск...
+            if (State__RA) IOStreamState.Out |= 0x1800; //поиск не закончен
+            else //все сообщения отправлены
+            { //отключаем режим RA в Flash
+                ReadScratchPad1();
+                FlashDump[5] = 0xAA;
+                WriteScratchPad1();
+    
+                StateAlarm = 0xFF;
+            }
+
+            return;
+
+        case 0xFF: //завершение
+
+            if (IOStreamState.Out & 0x8000) return; //пока не очищен буфер...
+
+            //разрешение записи в DataRAM[] и регистрации событий, если не было новой тревоги
+            Alarm_Enable = Lock_DataRAM;
+            if (RestoreSearch) //был прерван поиск; восстановить состояние поиска
+            {
+                SearchEnable = 1;
+                RdHeader.l = saveRdHeader;
+                pFD_Mask = FD_Auto;
+            }
+            pOutBuffer = FlashDump;
+
+            pEvents = &FlashDump[0x7B];
+            IOBufPointer = saveIOBufPointer; //восстанавливаем счетчик данных авторежима
+            IOStreamState.Out = saveIOStreamStateOut;
+            *(pInt = SMS_Tail) = saveSMS_Tail;
+
+            Auto_Enable = 1;
+
+            StateAlarm = 0x00;
+            return;
+
+        default:
+            StateAlarm = 0x00; //?
+    }
+}
+
+
+//изменить параметры LimitsData, если заданы некорректные значения
+void init_limits_data()
+{
+
+}
+
+void OpenDeviceProfile() //чтение из flash и установка всех профильных параметров устройства
+//если данные не были записаны в flash, устанавливаем значения по умолчанию
+{
+unsigned int xdata CheckSum;
+unsigned int xdata * pCheckSum = &FlashDump[128];
+//unsigned long xdata * pLong;
+unsigned int xdata Int;
+bit bWrPr2=0;
+
+    //чтение первого банка - маски событий, LimitsData
+
+    Char = 0; //счетчик байтов FlashDump
+
+    ReadFlash(F_ADDR_SETUP, 130);  reset_wdt;
+
+    for (CheckSum=0, cnt=0; cnt<128; cnt++) CheckSum += FlashDump[cnt];
+
+    if (CheckSum == *pCheckSum) //принимаем параметры, заданные Setup`ом
+    {
+        for (cnt=0; cnt<m_SIZE; cnt++)  mLogger.c[cnt]       = FlashDump[Char++];
+        for (cnt=0; cnt<m_SIZE; cnt++)  mAuto.c[cnt]         = FlashDump[Char++];
+        for (cnt=0; cnt<m_SIZE; cnt++)  mAlarm.c[cnt]        = FlashDump[Char++];
+
+        for (cnt=0; cnt<lim_SIZE; cnt++) LimitsData.All[cnt] = FlashDump[Char++];
+    }
+    else //принимаем параметры по умолчанию
+    {
+        DefaultProfile = 1; //добавляется в статус терминала, бит 3
+
+        mLogger.l.l1 = 0x8103000F;
+        mLogger.l.l2 = 0x00000000;
+        mAuto.l.l1   = 0x00000000; //0x80030000
+        mAuto.l.l2   = 0x00000000;
+        mAlarm.l.l1  = 0x00000000; //0x01000000 0x0100000F
+        mAlarm.l.l2  = 0x00000000;
+
+        LimitsData.Each.tem_critical_hi_n = 0x1;
+        LimitsData.Each.tem_critical_hi = 50;
+        LimitsData.Each.tem_critical_lo_n = 0x1;
+        LimitsData.Each.tem_critical_lo = -20;
+        LimitsData.Each.power_main_lo_n = 0x1;
+        LimitsData.Each.power_main_lo = 90;
+        LimitsData.Each.beacon_time_base = 0;
+        LimitsData.Each.beacon_time = 5;
+
+        LimitsData.Each.sensor_an1_hi_n = 0x1;
+        LimitsData.Each.sensor_an1_hi = 127;
+        LimitsData.Each.sensor_an2_hi_n = 0x1;
+        LimitsData.Each.sensor_an2_hi = 127;
+        LimitsData.Each.sensor_an3_hi_n = 0x1;
+        LimitsData.Each.sensor_an3_hi = 127;
+        LimitsData.Each.sensor_an4_hi_n = 0x1;
+        LimitsData.Each.sensor_an4_hi = 127;
+
+        LimitsData.Each.sensor_an1_lo_n = 0x1;
+        LimitsData.Each.sensor_an1_lo = 0;
+        LimitsData.Each.sensor_an2_lo_n = 0x1;
+        LimitsData.Each.sensor_an2_lo = 0;
+        LimitsData.Each.sensor_an3_lo_n = 0x1;
+        LimitsData.Each.sensor_an3_lo = 0;
+        LimitsData.Each.sensor_an4_lo_n = 0x1;
+        LimitsData.Each.sensor_an4_lo = 0;
+
+        LimitsData.Each.sensor_dry1_n = 0x2;
+        LimitsData.Each.sensor_dry2_n = 0x2;
+        LimitsData.Each.sensor_dry3_n = 0x2;
+        LimitsData.Each.sensor_dry4_n = 0x2;
+
+        LimitsData.Each.sensor_dry1_x = 0;
+        LimitsData.Each.sensor_dry2_x = 0;
+        LimitsData.Each.sensor_dry3_x = 0;
+        LimitsData.Each.sensor_dry4_x = 0;
+
+        LimitsData.Each.tem_microlan_hi_n = 0x1;
+        LimitsData.Each.tem_microlan_hi = 80;
+        LimitsData.Each.tem_microlan_lo_n = 0x1;
+        LimitsData.Each.tem_microlan_lo = -15;
+
+        LimitsData.Each.guarding_on_n = 0x1;
+        LimitsData.Each.guarding_off_n = 0x1;
+    }
+
+    reset_wdt;
+
+    init_limits_data();
+
+    //чтение масок формата вывода из Setup:
+
+    Char = 0;
+
+    ReadFlash(F_ADDR_SETUP+130, 130);  reset_wdt;
+
+    for (CheckSum=0, cnt=0; cnt<128; cnt++) CheckSum += FlashDump[cnt];
+
+    if (CheckSum == *pCheckSum) //принимаем параметры, заданные Setup`ом
+        for (cnt=0; cnt<64; cnt++)
+        {
+            FD_Auto[cnt]  = FlashDump[Char++];
+            FD_Alarm[cnt] = FlashDump[Char++];
+        }
+    else //принимаем параметры по умолчанию
+        for (cnt=0; cnt<64; cnt++) FD_Auto[cnt] = FD_Alarm[cnt] = 0x3F; //bits [0..5]
+
+
+    //остальные параметры
+    ReadFlash(F_ADDR_SETTINGS, 260); reset_wdt;
+
+    pCheckSum = &FlashDump[258];
+    for (CheckSum=0, Int=0; Int<258; Int++) CheckSum += FlashDump[Int];
+
+    reset_wdt;
+    // ****************************************
+    // принимаем параметры, заданные Setup`ом 2
+    // ****************************************
+    if (CheckSum == *pCheckSum)
+    {
+        // *** password, pin ****************************
+        //for (cnt=0; cnt<12; cnt++) S_Password[cnt] = FlashDump[cnt];
+        //for (cnt=0; cnt<4;  cnt++) S_PinCode[cnt]  = FlashDump[cnt+12];
+        // *** Пароль для текстовых sms-команд **********
+        len_pasw_sms=FlashDump[91]; if (len_pasw_sms>8) len_pasw_sms=0;
+        for (cnt=0; cnt<len_pasw_sms; cnt++) pasw_sms[cnt]=FlashDump[92+cnt];
+        // *** Маска событий для текстовых sms-тревог ***
+        //pLong = &FlashDump[101]; mAlert1_for_tsms = *pLong;
+        //pLong = &FlashDump[105]; mAlert2_for_tsms = *pLong;
+    }
+    // ********************************************
+    // Параметры по умолчанию (заводские установки)
+    // ********************************************
+    else
+    {
+        Param_default(0); bWrPr2=1;
+    }
+
+    Char = 0;
+    // ***************************
+    // MicroLan Device serial code
+    // ***************************
+    //1) считать SN с устройства MicroLan
+    StateLAN = 0x90; //пропустить определение температуры
+    while (1)
+    {
+        if (VLAN) automat_vlan(); else automat_lan();     reset_wdt;
+        if (StLAN.b.fReadySN) break;
+    }
+    //2) сравнить SN с кодом в Flash uC
+    if (StLAN.b.fFailSN==0) //SN считан
+    {
+        for (cnt=0; cnt<8; cnt++)
+            if (context_LAN[cnt] != ID_RM[cnt])
+            {
+                for (Char=cnt; Char<8; Char++) FlashDump[18+Char] = context_LAN[Char];
+                reset_wdt;
+                bWrPr2=1; //записать новый SN в Flash uC
+                break;
+            }
+    }
+    //3) проверить CRC кода в Flash uC
+    for (cnt=0; cnt<8; cnt++)
+        if (ID_RM[cnt] != 0xFF) //код в Flash uC есть
+        {
+            data_crc_8[0] = 0;
+            for (Char=0; Char<7; Char++) crc_8_lan(ID_RM[Char]); //расчет CRC
+            if (data_crc_8[0] != ID_RM[7]) //код неверен
+            {
+                for (Char=cnt; Char<8; Char++) FlashDump[18+Char] = 0xFF;
+                reset_wdt;
+                bWrPr2=1; //записать [FF FF FF FF FF FF FF FF] в Flash uC
+            }
+            break;
+        }
+    reset_wdt;
+
+    if (bWrPr2)
+    {
+        // Посчитать новую контрольную сумму.
+        for (CheckSum=0, Int=0; Int<258; Int++) CheckSum += FlashDump[Int];
+        *pCheckSum = CheckSum; // Новая контрольная сумма.
+        WriteFlash(F_ADDR_SETTINGS, 260);
+    }
+
+    //---
+    NTicks = 2;
+}
+
+void reset_state_log()
+{
+    port_sensor_latch = 0x0000; //сброс блокирующих битов
+    port_ADC_latch = 0x00; //сброс блокирующих битов для АЦП
+}
+
+
+
+
+extern switchbank(unsigned char bank_number);
+
+
+//Рестарт программы на загрузчик
+typedef (*function)();
+void call_program_reset()
+{
+  function call_reset = (function)0x0000;
+
+    PSBANK = 0x11;
+    call_reset();
+}
+
+
+void main (void)
+{
+    //Системные инициализации____________________________________________________________
+
+   // switchbank(0);
+
+    config(); reset_wdt;
+
+    #ifdef GuardJTAG
+        LockJTAG();
+    #endif
+
+    GSM_OFF = 1; //новая  версия платы, включается 1
+    SENSOR1WR = 0xFF; //порты (сух контакты)
+    LED = 1; //выключение
+    //LED2C_RED = LED2C_GREEN = 0; //выключение
+    GSM_PWR_ON;
+    TEL_BUTTON = 1;
+    GSM_RTS = 0;
+    GSM_DTR = 0;
+
+    if(TAB_DET==0) StK8.b.fTabMode = 1; //подключено табло
+
+    //reset AtFlash chip (min 10 us)
+    RES_AT45 = 0;
+
+    Init_uart0();
+    Init_uart1(); reset_wdt;
+
+    init_k8();
+    
+    #ifndef DEBUG_GPRS_MAX
+     Init_max(0x0D); //set 1200 b/s
+    #endif
+
+    OpenDeviceProfile(); reset_wdt; //установка профильных параметров устройства
+
+    Beacon_timer = LimitsData.Each.beacon_time;
+
+    Init_io(); reset_wdt;
+
+    //reset AtFlash chip (min 10 us)
+    RES_AT45 = 1;
+
+    initialize_sensor(); //Иниц. контактов
+    initialize_rele();   //Иниц. реле
+
+    InitAF(); reset_wdt;
+
+    reset_wdt;
+
+    init_lan();
+
+    for (Int=0; Int<(AlarmPointSize+8)*AMOUNT_DATARAM_POINTS; Int++) DataRAM[Int] = 0xFF;
+
+    reset_wdt;
+
+    #ifndef DEBUG_GPRS_MAX
+     Init_max(0x0D); //set 1200 b/s
+    #endif
+
+    #ifdef DEBUG_GPRS_MAX
+     debug_gprs_init(); //DEBUG GPRS
+    #endif
+
+
+    //обновление установок программы в Scratchpad FLASH
+
+    //чтение из FLASH бита состояния установки под охрану
+    //локализация - Scratchpad Memory, адрес [00]
+    //чтение счетчика рестартов CPU
+    //локализация - Scratchpad Memory, адрес [01]
+    ReadScratchPad1();
+
+    _flag_secbut_on = (FlashDump[0] == 0x55);
+    //считать флаг наличия неотправленных тревог, начальный адрес журнала, счетчик тревог
+    if (FlashDump[5] == 0x55)
+    {
+        RA_Mode = 1;
+        RAA2 = *(pInt = &FlashDump[6]);
+        RA_cnt = FlashDump[10];
+    }
+
+    count_restart_cpu = FlashDump[1];
+    FlashDump[1] = ++count_restart_cpu;
+
+    WriteScratchPad1();
+
+
+
+
+    while (1) //бесконечный рабочий цикл
+    {
+       reset_wdt;
+
+       //AUTOMAT_IO____________________________________________________________
+       OutBufChange = IOStreamState.Out & 0x8000; //определяем, изменяет ли автомат данные в буфере
+       Automat_io(); reset_wdt; //передача информации по каналам связи GSM
+       automat_rmodem(); reset_wdt; //передача информации по радиомодему
+       if (OutBufChange ^ (IOStreamState.Out & 0x8000)) //буфер изменился
+           IOBufPointer = IOStreamState.Out & 0x00FF; //восстанавливаем длину данных буфера
+
+       if ((GSM_signal = Get_quality_signal()) == 0xFF) GSM_signal = GSM_signal_prev;
+
+       //регистрируем событие по изменению уровня сигнала:
+       if (GSM_signal != GSM_signal_prev) //0xFF - неопределен
+       {
+           switch (GSM_signal)
+           {
+               case 0:
+               case 1:
+                   mResult.b.level_gsm_lo = 1;
+                   break;
+               case 2:
+               case 3:
+               case 4:
+                   mResult.b.level_gsm_norm = 1;
+                   break;
+           }
+
+           GSM_signal_prev = GSM_signal;
+       }
+
+       //добавляем уровень GSM
+       DataLogger[0x04] = (GSM_signal & 0x07) << 4; //0x07 == неопр. уровень GSM
+
+
+       send_max(); //автомат передачи байтов по MAX
+
+
+        //AUTOMAT_АЦП__________________________________________________________
+        StartConvertADC();
+        if (FinishConvertADC()) //готовы результаты...
+        {
+            if (ADCBuffer[7]<=10) ADCBuffer[7] = 0;
+            Float1 = Kp * ADCBuffer[7];
+
+            if (Float1 < 2.4) Char = 1; //1 - error
+            else
+            {
+                Char = 0;
+                Float = 12.0 / Float1; //коэф. для 1-4 каналов АЦП
+            }
+
+            //запись в DataLogger
+
+            if ((port_ADC_latch & 0x01)==0)
+            {
+                /*if (!(LimitsData.Each.sensor_an1_hi_n & 0x08)) //корректировать по бортовому питанию
+                {
+                    if (Char) DataLogger[0x1D] = 0x00;
+                    else
+                    {
+                        Int = Float*ADCBuffer[0];
+                        DataLogger[0x1D] = Int>0x7F ? 0x7F : Int;
+                    }
+                }
+                else*/
+                    DataLogger[0x06] = ADCBuffer[0];
+            }
+            if ((port_ADC_latch & 0x02)==0)
+            {
+                /*if (!(LimitsData.Each.sensor_an2_hi_n & 0x08)) //корректировать по бортовому питанию
+                {
+                    if (Char) DataLogger[0x1E] = 0x00;
+                    else
+                    {
+                        Int = Float*ADCBuffer[1];
+                        DataLogger[0x1E] = Int>0x7F) ? 0x7F : Int;
+                    }
+                }
+                else*/
+                    DataLogger[0x07] = ADCBuffer[1];
+            }
+            if ((port_ADC_latch & 0x04)==0)
+            {
+                /*if (!(LimitsData.Each.sensor_an3_hi_n & 0x08)) //корректировать по бортовому питанию
+                {
+                    if (Char) DataLogger[0x1F] = 0x00;
+                    else
+                    {
+                        Int = Float*ADCBuffer[2];
+                        DataLogger[0x1F] = Int>0x7F ? 0x7F : Int;
+                    }
+                }
+                else*/
+                    DataLogger[0x08] = ADCBuffer[2];
+            }
+            if ((port_ADC_latch & 0x08)==0)
+            {
+                /*if (!(LimitsData.Each.sensor_an4_hi_n & 0x08)) //корректировать по бортовому питанию
+                {
+                    if (Char) DataLogger[0x20] = 0x00;
+                    else
+                    {
+                        Int = Float*ADCBuffer[3];
+                        DataLogger[0x20] = Int>0x7F ? 0x7F : Int;
+                    }
+                }
+                else*/
+                    DataLogger[0x09] = ADCBuffer[3];
+            }
+
+            if ((port_ADC_latch & 0x10)==0) DataLogger[0x0B] = Therm;
+
+            //бортовое питание
+            if (Float1 > 25.5) DataLogger[0x0A] = 255; else DataLogger[0x0A] = 10*Float1 ;
+            if (DataLogger[0x0A] < 10) DataLogger[0x0A] = 0;
+
+/*
+            //событие записывается в CurrentEvents.b.sensor_anX_Y;
+            //если параметр, заданный в Setup, указывает, что по данному фронту событие не
+            //обрабатывается, то оно отображается одновременно в PreviousEvents.b.sensor_anX_Y
+            // *********************************
+            // **   АЦП 1 больше нормы (1-4)  **
+            // *********************************
+            if (((LimitsData.Each.sensor_an1_hi_n & 4) && // реагировать если стоит под охраной
+                 (_flag_secbut_on)  &&  // стоит под охраной
+                 (_PowOnOS_wait2min)) ||  // ОС включена
+                 ((LimitsData.Each.sensor_an1_hi_n & 4)==0)) // или реагировать в любом случае
+            {
+                if (DataLogger[0x1D] >= LimitsData.Each.sensor_an1_hi - CurrentEvents.b.sensor_an1_hi * HystADC)
+                {
+                    CurrentEvents.b.sensor_an1_hi = 1;
+                    if (!PreviousEvents.b.sensor_an1_hi)
+                    {
+                        PreviousEvents.b.sensor_an1_hi = !(LimitsData.Each.sensor_an1_hi_n & 0x01);
+                        if ((LimitsData.Each.sensor_an1_hi_n&0x01)&&
+                            (mLogger.b.sensor_an1_hi))
+                             port_ADC_latch |= 0x01;
+                    }
+                }
+                else
+                {
+                    CurrentEvents.b.sensor_an1_hi = 0;
+                    if (PreviousEvents.b.sensor_an1_hi)
+                    {
+                        PreviousEvents.b.sensor_an1_hi = (bit)(LimitsData.Each.sensor_an1_hi_n & 0x02);
+                        if ((LimitsData.Each.sensor_an1_hi_n&0x02)&&
+                            (mLogger.b.sensor_an1_hi))
+                             port_ADC_latch |= 0x01;
+                    }
+                }
+            }
+            // *********************************
+            // **   АЦП 1 меньше нормы (1-4)  **
+            // *********************************
+            if (((LimitsData.Each.sensor_an1_lo_n & 4) && // реагировать если стоит под охраной
+                 (_flag_secbut_on)  &&  // стоит под охраной
+                 (_PowOnOS_wait2min)) ||  // ОС включена
+                 ((LimitsData.Each.sensor_an1_lo_n & 4)==0)) // или реагировать в любом случае
+            {
+                if (DataLogger[0x1D] <= LimitsData.Each.sensor_an1_lo + CurrentEvents.b.sensor_an1_lo * HystADC)
+                {
+                    CurrentEvents.b.sensor_an1_lo = 1;
+                    if (!PreviousEvents.b.sensor_an1_lo)
+                    {
+                        PreviousEvents.b.sensor_an1_lo = !(LimitsData.Each.sensor_an1_lo_n & 0x01);
+                        if ((LimitsData.Each.sensor_an1_lo_n&0x01)&&
+                            (mLogger.b.sensor_an1_lo))
+                             port_ADC_latch |= 0x01;
+                    }
+                }
+                else
+                {
+                    CurrentEvents.b.sensor_an1_lo = 0;
+                    if (PreviousEvents.b.sensor_an1_lo)
+                    {
+                        PreviousEvents.b.sensor_an1_lo = (bit)(LimitsData.Each.sensor_an1_lo_n & 0x02);
+                        if ((LimitsData.Each.sensor_an1_lo_n&0x02)&&
+                            (mLogger.b.sensor_an1_lo))
+                             port_ADC_latch |= 0x01;
+                    }
+                }
+            }
+            // *********************************
+            // **   АЦП 2 больше нормы (1-4)  **
+            // *********************************
+            if (((LimitsData.Each.sensor_an2_hi_n & 4) && // реагировать если стоит под охраной
+                 (_flag_secbut_on)  &&  // стоит под охраной
+                 (_PowOnOS_wait2min)) ||  // ОС включена
+                 ((LimitsData.Each.sensor_an2_hi_n & 4)==0)) // или реагировать в любом случае
+            {
+                if (DataLogger[0x1E] >= LimitsData.Each.sensor_an2_hi - CurrentEvents.b.sensor_an2_hi * HystADC)
+                {
+                    CurrentEvents.b.sensor_an2_hi = 1;
+                    if (!PreviousEvents.b.sensor_an2_hi)
+                    {
+                        PreviousEvents.b.sensor_an2_hi = !(LimitsData.Each.sensor_an2_hi_n & 0x01);
+                        if ((LimitsData.Each.sensor_an2_hi_n&0x01)&&
+                            (mLogger.b.sensor_an2_hi))
+                             port_ADC_latch |= 0x02;
+                    }
+                }
+                else
+                {
+                    CurrentEvents.b.sensor_an2_hi = 0;
+                    if (PreviousEvents.b.sensor_an2_hi)
+                    {
+                        PreviousEvents.b.sensor_an2_hi = (bit)(LimitsData.Each.sensor_an2_hi_n & 0x02);
+                        if ((LimitsData.Each.sensor_an2_hi_n&0x02)&&
+                            (mLogger.b.sensor_an2_hi))
+                             port_ADC_latch |= 0x02;
+                    }
+                }
+            }
+            // *********************************
+            // **   АЦП 2 меньше нормы (1-4)  **
+            // *********************************
+            if (((LimitsData.Each.sensor_an2_lo_n & 4) && // реагировать если стоит под охраной
+                 (_flag_secbut_on)  &&  // стоит под охраной
+                 (_PowOnOS_wait2min)) ||  // ОС включена
+                 ((LimitsData.Each.sensor_an2_lo_n & 4)==0)) // или реагировать в любом случае
+            {
+                if (DataLogger[0x1E] <= LimitsData.Each.sensor_an2_lo + CurrentEvents.b.sensor_an2_lo * HystADC)
+                {
+                    CurrentEvents.b.sensor_an2_lo = 1;
+                    if (!PreviousEvents.b.sensor_an2_lo)
+                    {
+                        PreviousEvents.b.sensor_an2_lo = !(LimitsData.Each.sensor_an2_lo_n & 0x01);
+                        if ((LimitsData.Each.sensor_an2_lo_n&0x01)&&
+                            (mLogger.b.sensor_an2_lo))
+                             port_ADC_latch |= 0x02;
+                    }
+                }
+                else
+                {
+                    CurrentEvents.b.sensor_an2_lo = 0;
+                    if (PreviousEvents.b.sensor_an2_lo)
+                    {
+                        PreviousEvents.b.sensor_an2_lo = (bit)(LimitsData.Each.sensor_an2_lo_n & 0x02);
+                        if ((LimitsData.Each.sensor_an2_lo_n&0x02)&&
+                            (mLogger.b.sensor_an2_lo))
+                             port_ADC_latch |= 0x02;
+                    }
+                }
+            }
+            // *********************************
+            // **   АЦП 3 больше нормы (1-4)  **
+            // *********************************
+            if (((LimitsData.Each.sensor_an3_hi_n & 4) && // реагировать если стоит под охраной
+                 (_flag_secbut_on)  &&  // стоит под охраной
+                 (_PowOnOS_wait2min)) ||  // ОС включена
+                 ((LimitsData.Each.sensor_an3_hi_n & 4)==0)) // или реагировать в любом случае
+            {
+                if (DataLogger[0x1F] >= LimitsData.Each.sensor_an3_hi - CurrentEvents.b.sensor_an3_hi * HystADC)
+                {
+                    CurrentEvents.b.sensor_an3_hi = 1;
+                    if (!PreviousEvents.b.sensor_an3_hi)
+                    {
+                        PreviousEvents.b.sensor_an3_hi = !(LimitsData.Each.sensor_an3_hi_n & 0x01);
+                        if ((LimitsData.Each.sensor_an3_hi_n&0x01)&&
+                            (mLogger.b.sensor_an3_hi))
+                             port_ADC_latch |= 0x04;
+                    }
+                }
+                else
+                {
+                    CurrentEvents.b.sensor_an3_hi = 0;
+                    if (PreviousEvents.b.sensor_an3_hi)
+                    {
+                        PreviousEvents.b.sensor_an3_hi = (bit)(LimitsData.Each.sensor_an3_hi_n & 0x02);
+                        if ((LimitsData.Each.sensor_an3_hi_n&0x02)&&
+                            (mLogger.b.sensor_an3_hi))
+                             port_ADC_latch |= 0x04;
+                    }
+                }
+            }
+            // *********************************
+            // **   АЦП 3 меньше нормы (1-4)  **
+            // *********************************
+            if (((LimitsData.Each.sensor_an3_lo_n & 4) && // реагировать если стоит под охраной
+                 (_flag_secbut_on)  &&  // стоит под охраной
+                 (_PowOnOS_wait2min)) ||  // ОС включена
+                 ((LimitsData.Each.sensor_an3_lo_n & 4)==0)) // или реагировать в любом случае
+            {
+                if (DataLogger[0x1F] <= LimitsData.Each.sensor_an3_lo + CurrentEvents.b.sensor_an3_lo * HystADC)
+                {
+                    CurrentEvents.b.sensor_an3_lo = 1;
+                    if (!PreviousEvents.b.sensor_an3_lo)
+                    {
+                        PreviousEvents.b.sensor_an3_lo = !(LimitsData.Each.sensor_an3_lo_n & 0x01);
+                        if ((LimitsData.Each.sensor_an3_lo_n&0x01)&&
+                            (mLogger.b.sensor_an3_lo))
+                             port_ADC_latch |= 0x04;
+                    }
+                }
+                else
+                {
+                    CurrentEvents.b.sensor_an3_lo = 0;
+                    if (PreviousEvents.b.sensor_an3_lo)
+                    {
+                        PreviousEvents.b.sensor_an3_lo = (bit)(LimitsData.Each.sensor_an3_lo_n & 0x02);
+                        if ((LimitsData.Each.sensor_an3_lo_n&0x02)&&
+                            (mLogger.b.sensor_an3_lo))
+                             port_ADC_latch |= 0x04;
+                    }
+                }
+            }
+            // *********************************
+            // **   АЦП 4 больше нормы (1-4)  **
+            // *********************************
+            if (((LimitsData.Each.sensor_an4_hi_n & 4) && // реагировать если стоит под охраной
+                 (_flag_secbut_on)  &&  // стоит под охраной
+                 (_PowOnOS_wait2min)) ||  // ОС включена
+                 ((LimitsData.Each.sensor_an4_hi_n & 4)==0)) // или реагировать в любом случае
+            {
+                if (DataLogger[0x20] >= LimitsData.Each.sensor_an4_hi - CurrentEvents.b.sensor_an4_hi * HystADC)
+                {
+                    CurrentEvents.b.sensor_an4_hi = 1;
+                    if (!PreviousEvents.b.sensor_an4_hi)
+                    {
+                        PreviousEvents.b.sensor_an4_hi = !(LimitsData.Each.sensor_an4_hi_n & 0x01);
+                        if ((LimitsData.Each.sensor_an4_hi_n&0x01)&&
+                            (mLogger.b.sensor_an4_hi))
+                             port_ADC_latch |= 0x08;
+                    }
+                }
+                else
+                {
+                    CurrentEvents.b.sensor_an4_hi = 0;
+                    if (PreviousEvents.b.sensor_an4_hi)
+                    {
+                        PreviousEvents.b.sensor_an4_hi = (bit)(LimitsData.Each.sensor_an4_hi_n & 0x02);
+                        if ((LimitsData.Each.sensor_an4_hi_n&0x02)&&
+                            (mLogger.b.sensor_an4_hi))
+                             port_ADC_latch |= 0x08;
+                    }
+                }
+            }
+            // *********************************
+            // **   АЦП 4 меньше нормы (1-4)  **
+            // *********************************
+            if (((LimitsData.Each.sensor_an4_lo_n & 4) && // реагировать если стоит под охраной
+                 (_flag_secbut_on)  &&  // стоит под охраной
+                 (_PowOnOS_wait2min)) ||  // ОС включена
+                 ((LimitsData.Each.sensor_an4_lo_n & 4)==0)) // или реагировать в любом случае
+            {
+                if (DataLogger[0x20] <= LimitsData.Each.sensor_an4_lo + CurrentEvents.b.sensor_an4_lo * HystADC)
+                {
+                    CurrentEvents.b.sensor_an4_lo = 1;
+                    if (!PreviousEvents.b.sensor_an4_lo)
+                    {
+                        PreviousEvents.b.sensor_an4_lo = !(LimitsData.Each.sensor_an4_lo_n & 0x01);
+                        if ((LimitsData.Each.sensor_an4_lo_n&0x01)&&
+                            (mLogger.b.sensor_an4_lo))
+                             port_ADC_latch |= 0x08;
+                    }
+                }
+                else
+                {
+                    CurrentEvents.b.sensor_an4_lo = 0;
+                    if (PreviousEvents.b.sensor_an4_lo)
+                    {
+                        PreviousEvents.b.sensor_an4_lo = (bit)(LimitsData.Each.sensor_an4_lo_n & 0x02);
+                        if ((LimitsData.Each.sensor_an4_lo_n&0x02)&&
+                            (mLogger.b.sensor_an4_lo))
+                             port_ADC_latch |= 0x08;
+                    }
+                }
+            }*/
+reset_wdt;
+            //если напряжение ниже критического, пишем "1", иначе - "0"
+            //pow  21 В
+            if (DataLogger[0x0A] <= LimitsData.Each.power_main_lo + CurrentEvents.b.power_main_lo * HystVolt)
+            {
+                CurrentEvents.b.power_main_lo = 1;
+                if (!PreviousEvents.b.power_main_lo)
+                    PreviousEvents.b.power_main_lo = !(LimitsData.Each.power_main_lo_n & 0x01);
+            }
+            else
+            {
+                CurrentEvents.b.power_main_lo = 0;
+                if (PreviousEvents.b.power_main_lo)
+                    PreviousEvents.b.power_main_lo = (bit)(LimitsData.Each.power_main_lo_n & 0x02);
+            }
+/*
+            ///LED2C
+            if (DataLogger[0x23] < 25) //нет акк.
+            {
+                if ((cLED2 & 0x07) != 0x02) cLED2 &= ~0x07;
+                cLED2 |= 0x01;
+                if ((cLED2 & 0x70) == 0x10) cLED2 &= ~0x10;
+            }
+            else
+            {
+                if (DataLogger[0x1F] < 30) //т.е. нет SIM
+                {
+                    cLED2 &= ~0x70;
+                    cLED2 |= 0x10;
+                }
+                else
+                    if ((cLED2 & 0x70) == 0x10) cLED2 &= ~0x10;
+            }*/
+            //----------
+            if (ADCBuffer[5] >= 50) //т.е. есть USB
+                StSYSTEM |= 0x0001;
+            else
+                StSYSTEM &= ~0x0001;
+
+            // *****************************************
+            // * температура чипа с учетом гистерезиса *
+            // *****************************************
+            if ((signed char)DataLogger[0x0B] >= LimitsData.Each.tem_critical_hi - CurrentEvents.b.tem_critical_hi * HystTherm)
+            {
+                CurrentEvents.b.tem_critical_hi = 1;
+                if (!PreviousEvents.b.tem_critical_hi)
+                {
+                    PreviousEvents.b.tem_critical_hi = !(LimitsData.Each.tem_critical_hi_n & 0x01);
+                    if ((LimitsData.Each.tem_critical_hi_n & 0x01)&&
+                        (mLogger.b.tem_critical_hi))
+                         port_ADC_latch |= 0x10;
+                }
+            }
+            else
+            {
+                CurrentEvents.b.tem_critical_hi = 0;
+                if (PreviousEvents.b.tem_critical_hi)
+                {
+                    PreviousEvents.b.tem_critical_hi = (bit)(LimitsData.Each.tem_critical_hi_n & 0x02);
+                    if ((LimitsData.Each.tem_critical_hi_n & 0x02)&&
+                        (mLogger.b.tem_critical_hi))
+                         port_ADC_latch |= 0x10;
+                }
+            }
+            if ((signed char)DataLogger[0x0B] <= LimitsData.Each.tem_critical_lo + CurrentEvents.b.tem_critical_lo * HystTherm)
+            {
+                CurrentEvents.b.tem_critical_lo = 1;
+                if (!PreviousEvents.b.tem_critical_lo)
+                {
+                    PreviousEvents.b.tem_critical_lo = !(LimitsData.Each.tem_critical_lo_n & 0x01);
+                    if ((LimitsData.Each.tem_critical_lo_n & 0x01)&&
+                        (mLogger.b.tem_critical_lo))
+                         port_ADC_latch |= 0x10;
+                }
+            }
+            else
+            {
+                CurrentEvents.b.tem_critical_lo = 0;
+                if (PreviousEvents.b.tem_critical_lo)
+                {
+                    PreviousEvents.b.tem_critical_lo = (bit)(LimitsData.Each.tem_critical_lo_n & 0x02);
+                    if ((LimitsData.Each.tem_critical_lo_n & 0x02)&&
+                        (mLogger.b.tem_critical_lo))
+                         port_ADC_latch |= 0x10;
+                }
+            }
+        } //if (FinishConvertADC())
+
+        reset_wdt;
+
+        //AUTOMAT_MICROLAN_____________________________________________________
+        if (VLAN) automat_vlan(); else automat_lan();     reset_wdt;
+        //температура MicroLan с учетом гистерезиса
+        if (Lan_temper != 0x7F) //нет состояния ошибки MicroLan
+        {
+         if (Lan_temper >= LimitsData.Each.tem_microlan_hi - (CurrentEvents.b.tem_microlan_hi * HystTherm))
+         {
+             CurrentEvents.b.tem_microlan_hi = 1;
+             if (!PreviousEvents.b.tem_microlan_hi)
+                 PreviousEvents.b.tem_microlan_hi = !(LimitsData.Each.tem_microlan_hi_n & 0x01);
+         }
+         else
+         {
+             CurrentEvents.b.tem_microlan_hi = 0;
+             if (PreviousEvents.b.tem_microlan_hi)
+                 PreviousEvents.b.tem_microlan_hi = (bit)(LimitsData.Each.tem_microlan_hi_n & 0x02);
+         }
+         if (Lan_temper <= LimitsData.Each.tem_microlan_lo + (CurrentEvents.b.tem_microlan_lo * HystTherm))
+         {
+             CurrentEvents.b.tem_microlan_lo = 1;
+             if (!PreviousEvents.b.tem_microlan_lo)
+                 PreviousEvents.b.tem_microlan_lo = !(LimitsData.Each.tem_microlan_lo_n & 0x01);
+         }
+         else
+         {
+             CurrentEvents.b.tem_microlan_lo = 0;
+             if (PreviousEvents.b.tem_microlan_lo)
+                 PreviousEvents.b.tem_microlan_lo = (bit)(LimitsData.Each.tem_microlan_lo_n & 0x02);
+         }
+       } //if (Lan_temper != 0x7F)
+
+       //AUTOMAT_IO_DOUBLE_2___________________________________________________
+       
+	   OutBufChange = IOStreamState.Out & 0x8000; //определяем, изменяет ли автомат данные в буфере
+       Automat_io(); reset_wdt; //передача информации по каналам связи GSM
+       automat_rmodem(); reset_wdt; //передача информации по радиомодему
+       
+	   if(OutBufChange ^ (IOStreamState.Out & 0x8000)) //буфер изменился
+           IOBufPointer = IOStreamState.Out & 0x00FF; //восстанавливаем длину данных буфера
+
+        //AUTOMAT_SENSOR_______________________________________________________
+        automat_sensor();   reset_wdt; //Работа с датчиками
+
+        //автомат работы с исполнительными устройствами________________________
+        automat_rele();     reset_wdt;
+
+        //GPRS_________________________________________________________________
+        OutBufChange = 0;
+        automat_gprs_glob(); reset_wdt;
+        if (OutBufChange) IOBufPointer = IOStreamState.Out & 0x00FF; //восстанавливаем длину данных буфера
+
+        //ОПРОС_ДЕТЕКТОРОВ_ТРАНСПОРТА__________________________________________
+        automat_k8();       reset_wdt;
+
+        //УСТАНОВКА РЕЖИМОВ ИНДИКАТОРОВ________________________________________
+        automat_leds();
+
+        //РАБОТА_МАЯКА_________________________________________________________
+        if (!ForbiddenAll && (Day_timer >= 1440)) //00:00 - время GPS
+        //новый отсчет Day_timer
+        {
+            Day_timer = 0;
+            Beacon_Enable = 0;
+            //обнуление счетчика рестартов CPU
+            count_restart_cpu = 0;
+        }
+        if (Beacon_Enable) //маяк включен
+        {
+            if (Beacon_timer >= LimitsData.Each.beacon_time)
+            {
+                if (!ForbiddenAll) //время определено - формируется событие маяка
+                {
+                    mResult.b.beacon_time = 1;
+                    Beacon_timer = 0;
+                }
+                else //время неизвестно - формируется запрос пакета ONLINE
+                if (PreviousEvents.b.reset_cpu && !(IOStreamState.In & 0xC000)) //буфер не занят, после рестарта CPU
+                {
+                    IOStreamBuf.In[0] = 0x4F;
+                    IOStreamState.In = 0x8101;
+                    Beacon_timer = 0;
+                }
+            }
+        }
+        else //до включения маяка
+        if (Beacon_timer)
+        {
+            if (Day_timer >= LimitsData.Each.beacon_time_base)
+            {
+                if (Day_timer == LimitsData.Each.beacon_time_base)
+                    mResult.b.beacon_time = 1;
+                Beacon_Enable = 1; //нач. отсчет интервалов времени маяка
+                Beacon_timer = (Day_timer - LimitsData.Each.beacon_time_base) % LimitsData.Each.beacon_time;
+            }
+            else
+                Beacon_timer = 0;
+        }
+
+
+        send_max(); //автомат передачи байтов по MAX
+
+
+        //записываем статус терминала
+        DataLogger[0x04] |= ((unsigned char)_flag_secbut_on)        | //под охраной?
+                          //((unsigned char)                  << 1) | //
+                          //((unsigned char)                  << 2) | //
+                            ((unsigned char)DefaultProfile    << 3) ; //профиль "по умолчанию"
+
+        //события регистрируются  н е п р е р ы в н о
+        mResult.l.l1 |= (CurrentEvents.l.l1) ^ (PreviousEvents.l.l1);
+        mResult.l.l2 |= (CurrentEvents.l.l2) ^ (PreviousEvents.l.l2);
+
+
+      if (Timer_tick)
+      {
+        Timer_tick = 0;
+
+
+        //добавляем текущее время
+        pChar = &Timer_inside;
+       int_timer2_no;
+        for (cnt=0; cnt<4; cnt++) DataLogger[cnt] = pChar[cnt];
+       int_timer2_yes;
+
+        if (CurrentEvents.b.reset_cpu)
+        {
+        //накопление событий по тревоге ~~раз в сек
+        AddAlarmEvents.l.l1 |= (mResult.l.l1) & (mAlarm.l.l1);
+        AddAlarmEvents.l.l2 |= (mResult.l.l2) & (mAlarm.l.l2);
+
+
+        //записываем текущие состояния сухих контактов, реле
+        DataLogger[0x05] = (port_sensor_current & 0x0F) | get_sost_rele();
+
+
+        //запись в аварийный буфер и регистрация событий по тревоге
+        if (StateAlarm != 0x03) //нет передачи буфера DataRAM[] в IOStreamBuf.Out[]
+        {
+            if ((AddAlarmEvents.l.l1) || (AddAlarmEvents.l.l2)) //произошли события
+            {
+                if (RA_Mode) //нет связи GSM - тревогу не отправлять
+                {
+                    RA_cnt++;
+                    if (!Alarm_Enable) //сейчас не обрабатываются неотправленные тревоги
+                    {
+                        if (RA_cnt >= RA_cnt_MAX) //накоплено макс. допустимое кол. неотправленных тревог
+                        {
+                            RAA2 = RAA3;
+                            RA_cnt = RA_cnt_MIN; //уст. минимальное кол. неотправленных тревог
+                            StateAlarm = 0x11; //записать в ScratchPad flash
+                        }
+                        if (RA_cnt == RA_cnt_MIN) //запомнить адрес (в журнале) текущей тревоги
+                            RAA3 = (WrHeader.t.Page << 2) | (WrHeader.t.Byte >> 6); //(для DataFlash 4 MBit)
+                    }
+                }
+                else
+                {
+                    AlarmEvents.l.l1 |= AddAlarmEvents.l.l1; //передать маску в автомат
+                    AlarmEvents.l.l2 |= AddAlarmEvents.l.l2; //---//---//
+
+                    if (Lock_DataRAM == 0) //первая тревога в буфере
+                    {
+                        //запомнить адрес (в журнале), куда запишется данная тревога (для DataFlash 4 MBit)
+                        RAA1 = (WrHeader.t.Page << 2) | (WrHeader.t.Byte >> 6);
+                        RA_tmp = 1; //имеется 1 неотправленная тревога
+                    }
+                    else RA_tmp++; //увеличилось кол. неотправленных тревог
+                    Alarm_Enable = Lock_DataRAM = 1;
+                }
+                TickCounter = NTicks; //немедленно записать в журнал и очистить mResult
+                //добавить в журнал признак тревоги (DataLogger[0x7E], бит 7)
+                DataLogger[0x04] |= 0x80;
+                AlarmTickCounter = NAlarmTicks; //немедленно записать последнюю точку
+            }
+            else //не было событий по тревоге
+                if (Lock_DataRAM) AlarmTickCounter = 0; //буфер заблокирован; пропустить запись
+
+            if (AlarmTickCounter++ >= NAlarmTicks)
+            {
+                AlarmTickCounter = 1;
+
+                for (cnt=0; cnt<AlarmPointSize; cnt++) DataRAM[DataRAMPointer++] = DataLogger[cnt];
+                for (cnt=0; cnt<8; cnt++) DataRAM[DataRAMPointer++] = AddAlarmEvents.c[cnt];
+                if (DataRAMPointer == (AlarmPointSize+8)*AMOUNT_DATARAM_POINTS) DataRAMPointer = 0;
+
+                //при включении/рестарте процессора AmountAlarmPoints = 0
+                if (AmountAlarmPoints < AMOUNT_DATARAM_POINTS) AmountAlarmPoints++;
+
+                AddAlarmEvents.l.l1 = AddAlarmEvents.l.l2 = 0;
+            }
+        }
+
+        reset_wdt;
+
+        //РАБОТА_С_БУФЕРОМ_СОСТОЯНИЯ_СИСТЕМЫ_-_DataLogger[]____________________
+        if (++TickCounter >= NTicks) //обработка выполняется через интервал времени,
+                                     //кратный ~~ 1 cек
+        {
+            TickCounter = 0;
+
+            //* XXXXXX11 - начать опрос датчиков 1, 2 (KOD8)
+            startK8 = 0x03;
+
+
+            if (GetBack_m) //при появлении времени GPS или после задержки записи в EEPROM
+            {
+                ForbiddenAll = GetBack_m = 0;
+                mResult.l.l1 |= mStore.l.l1; //восстановление событий для записи в DataLogger
+                mResult.l.l2 |= mStore.l.l2; //--||--
+                mStore.l.l2 = mStore.l.l1 = 0;
+            } //if (GetBack_m)
+
+            mResult.l.l1 &= mLogger.l.l1; //необрабатываемые события отсеиваем
+            mResult.l.l2 &= mLogger.l.l2;
+
+/*!!!*      if ((mResult.l.l1 & mAlert1_for_tsms) || // сработало событие для текстовой sms-тревоги.
+                (mResult.l.l2 & mAlert2_for_tsms))
+            {
+                alert1_for_tsms |= mResult.l.l1 & mAlert1_for_tsms;
+                alert2_for_tsms |= mResult.l.l2 & mAlert2_for_tsms;
+            }
+*/
+            if (ForbiddenAll) //время GPS еще не известно
+            {
+                mStore.l.l1 |= mResult.l.l1; //запомнить события
+                mStore.l.l2 |= mResult.l.l2; //--||--
+            }
+            else //время GPS обновилось; обработка накопленных событий:____________
+            if ((mResult.l.l1) || (mResult.l.l2)) //произошли события
+            {
+
+                //добавление битов-признаков записи в DataLogger
+                for (cnt=0; cnt<4; cnt++)
+                    DataLogger[0x7B + cnt] = mResult.c[cnt];
+
+                //добавление контрольной суммы
+                for (Char=0,cnt=0; cnt<0x7F; cnt++) Char += DataLogger[cnt];
+                DataLogger[0x7F] = Char ^ mLogCS;
+
+                //запись в энергонезависимую память (журнал):
+                BufAF = DataLogger; //источник
+                WriteAF(); //процесс...
+
+                reset_wdt;
+
+                //очистить признак тревоги
+                DataLogger[0x04] &= ~0x80;
+
+                //работа со счетчиком CountAuto
+                if (((mResult.l.l1) & (mAuto.l.l1)) || ((mResult.l.l2) & (mAuto.l.l2))) CountAuto++;
+
+            } //if ((mResult.l.l1) || (mResult.l.l2))
+
+            //копирование битов-признаков
+            PreviousEvents.l.l1 = CurrentEvents.l.l1;
+            PreviousEvents.l.l2 = CurrentEvents.l.l2;
+
+            //сброс текущей маски событий
+            mResult.l.l1 = mResult.l.l2 = 0;
+
+            //обновить начальные (предыдущие) состояния
+            reset_state_log();
+
+        } //if (++TickCounter >= NTicks)
+        } //if (CurrentEvents.b.reset_cpu)
+        else
+            reset_state_log();
+      } //if (Timer_tick)
+
+        reset_wdt;
+
+        //автомат поиска данных в журнале______________________________________
+        if (SearchEnable) automat_search();             reset_wdt;
+
+        if (RM_Enable) automat_request(); //запрос по радиомодему
+        else
+        {
+        //автоматы тревоги и запроса ОБЯЗАТЕЛЬНО должны чередоваться___________
+        if (StateRequest == 0x00) automat_alarm();
+        if (StateAlarm == 0x00) automat_request();
+
+        reset_wdt;
+
+        //START_AUTO_OUTPUT____________________________________________________
+        if (Auto_Enable)
+        {
+        IOStreamState.Out |= 0x0800; //информация о режиме
+
+        if (CountAuto && !SearchEnable) //есть точки, выкл. поиск
+        { //считать последние CountAuto точек из журнала и записать в буфер вывода
+            Search1_Time = 0L;
+            Search2_Time = 0xFFFFFFFF;
+            MaskEvents.l.l1 = mAuto.l.l1;
+            MaskEvents.l.l2 = mAuto.l.l2;
+            AmountSearchPoints = CountAuto;
+            CountSearchPoints = 0;
+
+            pFD_Mask = FD_Auto;
+
+            SearchEnable = 1;
+            StateSearch = 0x00;
+            CountAuto = 0;
+
+            automat_search(); //set read addr immediately
+        } //if (CountAuto && !SearchEnable)
+        } //if (Auto_Enable)
+        } //if (RM_Enable)...else
+    } //while (1)
+} //void main (void)

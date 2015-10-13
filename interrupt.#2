@@ -1,0 +1,418 @@
+#include "c8051f120.h"
+#include <intrins.h>
+#include "adc.h"
+#include "atflash.h"
+#include "ds18b20.h"
+#include "main.h"
+#include "rele.h"
+#include "rmodem.h"
+#include "sensor.h"
+#include "uart.h"
+#include "gprs\gprs.h"
+#include "kod8.h"
+
+
+
+#define TimeoutRA 10 //таймаут [мин] ожидания появления связи GSM для передачи неотправленных тревог
+
+
+
+unsigned char xdata Timer2_10x = 0; //увеличение периода таймера (20 мс -> 100 мс)
+unsigned char xdata scount1s = 0;
+unsigned char xdata count1s = 0;
+
+unsigned int xdata m_LED = 0x0001;
+
+bit bTimer2_2x; //увеличение периода таймера (10 мс -> 20 мс)
+
+
+
+void Uart0_intr() interrupt 4 using 2
+{
+    if (TI0)
+    {
+        TI0 = 0;
+
+        if (cBufTxW) //есть данные в буфере
+        {
+            SBUF0 = buf_tx_uart0[cBufTxR];
+            if (++cBufTxR >= cBufTxW) cBufTxR = cBufTxW = 0; //весь буфер отправлен
+        }
+        else FlagTX0 = yes;
+    }
+    if (RI0)
+    {
+        RI0 = 0;
+        buf_rx_uart0[ukBuf_rx_w_uart0] = SBUF0;
+        if (sizeBuf_rx_uart0 < SIZE_BUF_RX_UART0)
+        {
+            ukBuf_rx_w_uart0++;
+            sizeBuf_rx_uart0++;
+            if (ukBuf_rx_w_uart0 >= SIZE_BUF_RX_UART0) ukBuf_rx_w_uart0 = 0;
+        }
+    }
+}
+
+void Uart1_intr() interrupt 20 using 2
+{
+    if (TI1)
+    {
+        TI1 = 0;
+
+        if (cBufTxW1) //есть данные в буфере
+        {
+            SBUF1 = buf_tx_uart1[cBufTxR1];
+            if (++cBufTxR1 >= cBufTxW1) cBufTxR1 = cBufTxW1 = 0; //весь буфер отправлен
+        }
+        else FlagTX1 = yes;
+    }
+    if (RI1)
+    {
+        RI1 = 0;
+        buf_rx_uart1[ukBuf_rx_w_uart1] = SBUF1;
+        if (sizeBuf_rx_uart1 < SIZE_BUF_RX_UART1)
+        {
+            ukBuf_rx_w_uart1++;
+            sizeBuf_rx_uart1++;
+            if (ukBuf_rx_w_uart1 >= SIZE_BUF_RX_UART1) ukBuf_rx_w_uart1 = 0;
+        }
+        //*-----------------*
+        LInK8++;
+		timer_hang_uart1 = 0;
+        //*-----------------*
+    }
+}
+
+void MAX_ISR() interrupt 2 using 2
+{
+  bit B;
+  unsigned char data C;
+
+    //Hold SPI for MAX
+    SFRPAGE = SPI0_PAGE;
+    CSEL0 = 0;
+    SPIEN = 0; //? disable SPI
+    SPI0CFG = 0x40;
+    SPI0CKR = 0x05;
+    SPI0CN  = 0x0B;
+    reset_wdt; //pause
+    
+    SPI0DAT = 0x00;
+    while (!SPIF) reset_wdt; SPIF = 0;
+    B = SPI0DAT & 0x02;
+    SPI0DAT = 0x00;
+    while (!SPIF) reset_wdt; SPIF = 0;
+    C = SPI0DAT;
+
+    CSEL0 = 1;
+    SPI0CFG = 0x70; //? set Phase/Polarity for AtFlash
+    SPI0CN = 0x0A; //? clear SPI interrupt flags, disable SPI
+
+//    if (!B) return; //мусор пришел
+    if (sizeBuf_rx_max < SIZE_BUF_RX_MAX)
+    {
+        sizeBuf_rx_max++;
+        buf_rx_max[ukBuf_rx_w_max++] = C;
+        if (ukBuf_rx_w_max >= SIZE_BUF_RX_MAX) ukBuf_rx_w_max = 0;
+    }
+}
+
+void Timer2Int() interrupt 5 using 1
+{
+  unsigned char data i;
+
+  TF2 = 0; //Clear Timer2 Overflow Flag
+
+
+    //счетчики в 0.005 сек
+
+    if (timer_k8_ms) --timer_k8_ms;
+
+    //*----------*
+    if (bTimer2_2x=!bTimer2_2x) return; //увеличение периода в 2 раза
+    //*----------*
+
+    //счетчики в 0.01 сек
+
+    tick_gprs++;
+
+    if (++Timer2_10x < 10) return; else Timer2_10x = 0; //увеличение периода в 10 раз
+
+
+    //счетчики в 0.1 сек
+
+    tick_gprs |= 0x10; ///GPRS
+
+/*    //Мигание светодиода при передаче SMS
+    if (!led_GSM1)
+    {
+        switch (cnt_led_GSM++)
+        {
+            case 00:
+                LED = 1;
+            break;
+
+            case 13:
+                if (!led_GSM2) LED = 0;
+            break;
+
+            case 14:
+                if (!led_GSM2) LED = 1;
+            break;
+
+            case 15:
+                LED = 0;
+                cnt_led_GSM = 0;
+            break;
+        }
+    }
+    else
+        LED = !LED;
+*/
+    //LEDs
+    SFRPAGE = CONFIG_PAGE;
+    //*-------------------*
+    LED     = (bit)(LED_Mode[StLED]         & m_LED);
+    LED1    = (bit)(LED1_Mode[StLED1]       & m_LED);
+    LEDSTAT = (bit)(LEDSTAT_Mode[StLEDSTAT] & m_LED);
+    //*-------------------*
+    m_LED = _irol_(m_LED,1);
+
+    if (++scount1s >= 10) //счетчики в секундах
+    {
+        scount1s = 0;
+
+        tick_gprs |= 0x20; ///GPRS
+
+        if (++count1s >= 60) //счетчики в минутах
+        {
+            count1s = 0;
+
+            CurrentEvents.b.reset_cpu = 1; //произошел <пере>запуск программы
+
+            Beacon_timer++;
+            Day_timer++;
+
+            if (++TimeRA >= TimeoutRA) {TimeRA = 0; StartRA;}
+        }
+
+        if (time_nogprs) time_nogprs--;
+
+        Rele_LCount++;
+
+        time_wait_io++;
+        time_wait_io2++;
+        time_wait_io3++;
+        time_wait_SMSPhone++;
+        time_wait_SMSPhone2++;
+
+        //работа встроенного таймера
+        Timer_tick = 1;
+        if (!ForbiddenAll) Timer_inside++;
+
+        time_wait_lan++;
+
+        time_wait_txtsms++;
+
+        if (timer0_k8_1) --timer0_k8_1;
+        if (timer1_k8_1) --timer1_k8_1;
+		if (timer_k8_uart1)--timer_k8_uart1;
+		if (timer_k8_res_uart1)--timer_k8_res_uart1;
+		if (timer_k8_gprs_delay)--timer_k8_gprs_delay;
+		
+		//timer_hang_uart1++; // считаем сек.
+    }
+
+    if (timer_k8_01) --timer_k8_01;
+
+    time_wait_SMSPhone1++;
+    time_wait_phone_receive++;
+
+    time_wait_test++;
+
+    for (i=0; i<8; i++) time_wait_sensor[i]++;
+
+    time_wait_RM++;
+}
+
+void AtFlashInt() interrupt 6 using 1
+{
+  WCOL = 0;
+  RXOVRN = 0;
+
+  if (SPIF)
+  {
+    SPIF = 0;
+
+    switch (StateIntAF)
+    {
+
+        //Запись блока данных в DataFlash______________________________________
+        //"BUFFER WRITE", "MAIN MEMORY PAGE PROGRAM THROUGH BUFFER"
+        //*HeaderAF - заголовок команды записи
+        //BufAF - указатель на начало блока
+        //BufEndAF - указатель на следующий (после записываемого блока) байт
+
+        case 0x01: //"START"
+        case 0x02:
+        case 0x03:
+            SPI0DAT = HeaderAF[StateIntAF];
+            break;
+
+        case 0x04:
+            SPI0DAT = *BufAF++;
+            if (BufAF < BufEndAF) return;
+            break;
+
+        case 0x05:
+            CSEL1 = 1;
+            int_ext1_yes;
+            StateIntAF = 0x00; //"END"
+            return;
+
+
+        //Опрос статуса (READY?/BUSY?)_________________________________________
+
+        case 0x11: //"START"
+            SPI0DAT = 0x00;
+            break;
+            
+        case 0x12:
+            if (SPI0DAT & 0x80)
+            {
+                CSEL1 = 1;
+                int_ext1_yes;
+                StateIntAF = 0x00; //"END"
+            }
+            else
+                SPI0DAT = 0x00;
+            return;
+
+
+        //Чтение блока данных из DataFlash_____________________________________
+        //"CONTINUOUS ARRAY READ", "BUFFER READ"
+        //*HeaderAF - заголовок команды чтения
+        //BufAF - указатель на начало блока
+        //BufEndAF - указатель на следующий (после считанного блока) байт
+    
+        case 0x21: case 0x61: //"START"
+        case 0x22: case 0x62:
+        case 0x23: case 0x63:
+            SPI0DAT = HeaderAF[StateIntAF & 0x0F];
+            break;
+            
+        case 0x24: case 0x64:
+        case 0x25: case 0x65:
+        case 0x26:
+        case 0x27:
+        case 0x28:
+            SPI0DAT = 0x00;
+            break;
+
+        case 0x29: case 0x66:
+            *BufAF++ = SPI0DAT;
+            if (BufAF < BufEndAF) SPI0DAT = 0x00;
+            else
+            {
+                CSEL1 = 1;
+                int_ext1_yes;
+                StateIntAF = 0x00; //"END"
+            }
+            return;
+
+
+        //"MAIN MEMORY PAGE TO BUFFER TRANSFER",
+        //"MAIN MEMORY PAGE PROGRAM THROUGH BUFFER" - all page
+        //"BUFFER WRITE" - all page
+        
+        case 0x31: case 0x41: case 0x51: //"START"
+        case 0x32: case 0x42: case 0x52:
+        case 0x33: case 0x43: case 0x53:
+            SPI0DAT = HeaderAF[StateIntAF & 0x0F];
+            break;
+
+        case 0x34: case 0x46: case 0x55:
+            CSEL1 = 1;
+            int_ext1_yes;
+            StateIntAF = 0x00; //"END"
+            return;
+
+        case 0x44:
+            SPI0DAT = *BufAF++;
+            if (BufAF < BufEndAF) return;
+            BufAF = 0;
+            break;
+
+        case 0x45: case 0x54:
+            SPI0DAT = 0xFF; //empty area ("Tail")
+            if (++BufAF < BufTailAF) return;
+            break;
+
+
+        default:
+            return;
+    } //switch (StateIntAF)
+
+    StateIntAF++;
+  } //if (SPIF)
+} //void AtFlashInt()
+
+void Timer3_VLAN_ISR() interrupt 14 using 3
+{
+unsigned char data vl_cnt;
+
+  TF3 = TR3 = 0; //clear overflow flag & stop timer
+
+    switch (StateVLAN)
+    {
+        //virtual reset_lan() - продолжение
+        case 0xA2:
+            LAN_0;
+            LAN_OUT;
+            StateVLAN = 0xA3;
+            VDELAY250;
+            return;
+        case 0xA3:
+            LAN_1;
+            LAN_IN;
+            StateVLAN = 0xA4;
+            VDELAY40;
+            return;
+        case 0xA4:
+            if (IF_LAN_0) _lan_exist = yes;
+            StateVLAN = 0xA5;
+            VDELAY500;
+            return;
+        case 0xA5:
+            if (_lan_exist==no) _err_lan = yes;
+            VLAN_INT = 0; //переключиться в режим вызова автомата из main()
+            return;
+
+        //virtual write_bit_lan() - продолжение
+        case 0xB2:
+            LAN_0;
+            LAN_OUT;
+            if (bit_data_lan==0)
+            {
+                StateVLAN = 0xB3;
+                VDELAY25;
+                return;
+            }
+            LAN_0;
+            LAN_OUT;
+            for (vl_cnt=0; vl_cnt<2; vl_cnt++);
+            LAN_1;
+            LAN_IN;
+            for (vl_cnt=0; vl_cnt<3; vl_cnt++);
+            if (IF_LAN_0) bit_data_lan = 0;
+            StateVLAN = 0xB3;
+            VDELAY17;
+            return;
+        case 0xB3:
+            LAN_1;
+            LAN_IN;
+            VLAN_INT = 0; //переключиться в режим вызова автомата из main()
+            VDELAY20;
+            return;
+    }
+}
